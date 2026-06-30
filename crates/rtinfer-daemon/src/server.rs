@@ -272,7 +272,7 @@ fn openai_content_text(content: &Option<Value>) -> Result<String, String> {
                     Value::Object(obj) => {
                         let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
                         match kind {
-                            "text" | "input_text" => {
+                            "text" | "input_text" | "output_text" => {
                                 if let Some(text) = obj.get("text").and_then(Value::as_str) {
                                     out.push_str(text);
                                 }
@@ -921,6 +921,17 @@ mod tests {
         }])
         .unwrap_err();
         assert!(err.contains("only text is supported"));
+    }
+
+    #[test]
+    fn openai_content_text_accepts_output_text_for_assistant_turns() {
+        // The Responses API sends prior assistant messages back with content
+        // parts of type "output_text" (not "input_text"); both must flatten.
+        let text = openai_content_text(&Some(Value::Array(vec![
+            json!({"type":"output_text","text":"previous answer"}),
+        ])))
+        .unwrap();
+        assert_eq!(text, "previous answer");
     }
 
     #[test]

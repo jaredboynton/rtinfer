@@ -51,6 +51,20 @@ rtinferd uninstall
 The daemon owns its own port (default **8765**) and advertises the live URL in
 `~/.cse-rtinfer/endpoint.json` on boot. cse-tools' cockpit keeps 8787.
 
+## Sticky Routing
+
+`realtime_structured` uses a warm-session pool with prompt-cache sticky routing:
+the system prompt hashes to a session family, repeated same-family calls stay on
+the same socket for cache hits, and same-family parallel bursts overflow without
+re-pinning so the next serial call still lands on the cache home.
+
+Tuning knobs:
+- `RTINFER_STICKY_ROUTING=0` disables sticky routing for A/B or rollback.
+- `RTINFER_STICKY_OVERFLOW_INFLIGHT=N` changes the overflow threshold. Default
+  `1` means any overlapping same-family call spills to another session.
+- Legacy `UNIFABLE_STICKY_ROUTING` and `UNIFABLE_STICKY_OVERFLOW_INFLIGHT`
+  remain accepted during the cutover.
+
 ## Clients (discovery order)
 
 1. `$CSE_RTINFER_URL` — explicit override / tests (`CSE_RTINFER_STRICT_URL=1` to trust only this)
