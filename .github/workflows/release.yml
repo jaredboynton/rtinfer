@@ -1,0 +1,102 @@
+name: release
+
+# Build rtinferd for darwin-arm64 + linux-arm64 on tag push, then publish the
+# platform packages and the meta @jaredboynton/rtinfer wrapper to npm.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rtinfer-release
+  cancel-in-progress: true
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "invalid version: $version" >&2; exit 1; }
+          for p in \
+            @jaredboynton/rtinfer \
+            @jaredboynton/rtinfer-darwin-arm64 \
+            @jaredboynton/rtinfer-linux-arm64; do
+            if npm view "$p@$version" version >/dev/null 2>&1; then
+              echo "refusing to republish existing: $p@$version" >&2; exit 1
+            fi
+          done
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [resolve-version]
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build rtinferd (release)
+        run: cargo build --release -p rtinfer-daemon --target ${{ matrix.target }}
+      - name: Stage binary
+        run: |
+          mkdir -p out/bin
+          cp "target/${{ matrix.target }}/release/rtinferd" out/bin/rtinferd
+          chmod +x out/bin/rtinferd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtinferd-${{ matrix.platform }}
+          path: out/bin/rtinferd
+
+  publish:
+    needs: [resolve-version, build]
+    runs-on: ubuntu-22.04
+    environment: npm-publish
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Assemble platform packages + sync clients
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          for platform in darwin-arm64 linux-arm64; do
+            mkdir -p "packages/$platform/bin"
+            cp "dl/rtinferd-$platform/rtinferd" "packages/$platform/bin/rtinferd"
+            chmod +x "packages/$platform/bin/rtinferd"
+          done
+          # Vendor canonical clients into the published meta package.
+          bash scripts/sync-clients.sh
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm publish packages/darwin-arm64 --access public
+          npm publish packages/linux-arm64 --access public
+          # Meta package last so the latest dist-tag only advances once the
+          # platform subpackages exist.
+          npm publish packages/js-wrapper --access public

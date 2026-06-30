@@ -1,0 +1,10 @@
+{
+  "name": "@jaredboynton/rtinfer-linux-arm64",
+  "version": "0.1.0",
+  "description": "Linux arm64 binary for @jaredboynton/rtinfer",
+  "license": "MIT",
+  "repository": "https://github.com/jaredboynton/rtinfer",
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "files": ["bin/rtinferd"]
+}

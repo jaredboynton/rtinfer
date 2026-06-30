@@ -1,0 +1,30 @@
+[package]
+name = "rtinfer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Codex-OAuth realtime + responses inference client (file-auth)."
+
+[lib]
+name = "rtinfer_core"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+warpsock = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["rustls-tls-native-roots", "connect", "handshake"] }
+http = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "test-util"] }
+tempfile = "3"

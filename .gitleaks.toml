@@ -1,0 +1,18 @@
+# gitleaks configuration: extend the default ruleset, then narrowly allowlist
+# the captured codex/responses protocol fixture.
+#
+# Why this is safe:
+#   The only finding is the streamed `resp_...` response id inside the live
+#   capture used by tests/responses_protocol.rs. It is a server-assigned
+#   response identifier, not a credential, and the same fixture is allowlisted
+#   in the upstream cse-tools repo it was forked from. The allowlist is scoped
+#   to that single file path so every other path is still fully scanned.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "codex/responses protocol capture: resp_* response ids are not secrets"
+paths = [
+  '''crates/rtinfer-core/tests/fixtures/codex_responses_worktime\.jsonl''',
+]

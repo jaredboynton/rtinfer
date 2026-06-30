@@ -1,0 +1,10 @@
+{
+  "name": "@jaredboynton/rtinfer-darwin-arm64",
+  "version": "0.1.0",
+  "description": "Apple Silicon binary for @jaredboynton/rtinfer",
+  "license": "MIT",
+  "repository": "https://github.com/jaredboynton/rtinfer",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["bin/rtinferd"]
+}

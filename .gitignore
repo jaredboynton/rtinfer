@@ -1,0 +1,18 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# npm
+node_modules/
+packages/*/bin/
+packages/js-wrapper/clients/
+clients/js/node_modules/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# local dev
+*.log
+.DS_Store

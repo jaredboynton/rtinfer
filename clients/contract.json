@@ -1,0 +1,52 @@
+{
+  "contract": "rtinfer/1",
+  "health": {
+    "request": { "method": "GET", "path": "/v1/infer/health" },
+    "response": {
+      "contract": "rtinfer/1",
+      "ready": true,
+      "provider": "rtinferd",
+      "tiers": ["realtime_structured", "responses_structured", "responses_text"]
+    }
+  },
+  "tiers": {
+    "realtime_structured": {
+      "request": {
+        "contract": "rtinfer/1",
+        "tier": "realtime_structured",
+        "system": "...",
+        "user": "...",
+        "schema_name": "result",
+        "schema": { "type": "object", "properties": {} },
+        "model": "gpt-realtime-2"
+      },
+      "response_ok": { "contract": "rtinfer/1", "ok": true, "tier": "realtime_structured", "object": {}, "model": "gpt-realtime-2" }
+    },
+    "responses_structured": {
+      "request": {
+        "contract": "rtinfer/1",
+        "tier": "responses_structured",
+        "system": "...",
+        "user": "...",
+        "schema_name": "result",
+        "schema": { "type": "object", "properties": {} }
+      },
+      "response_ok": { "contract": "rtinfer/1", "ok": true, "tier": "responses_structured", "object": {}, "model": "gpt-5.5" }
+    },
+    "responses_text": {
+      "request": {
+        "contract": "rtinfer/1",
+        "tier": "responses_text",
+        "system": "...",
+        "user": "...",
+        "model": "gpt-5.4"
+      },
+      "response_ok": { "contract": "rtinfer/1", "ok": true, "tier": "responses_text", "text": "...", "model": "gpt-5.4" }
+    }
+  },
+  "error_envelope": {
+    "contract": "rtinfer/1",
+    "ok": false,
+    "error": { "code": "provider_error", "message": "...", "retryable": true }
+  }
+}
