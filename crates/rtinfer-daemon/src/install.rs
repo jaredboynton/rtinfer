@@ -15,22 +15,30 @@
 //! only opens loopback sockets and reads `~/.codex/auth.json`, so no codesign
 //! pinning is required.
 
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
-use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
+use anyhow::Context;
+use anyhow::Result;
 
 /// launchd label for the rtinfer daemon.
+#[cfg(target_os = "macos")]
 pub const LABEL: &str = "com.jaredboynton.rtinferd";
 
 /// Override the launched program path (set by the npm postinstall to the exact
 /// global bin shim). Takes precedence over npm-prefix discovery.
+#[cfg(target_os = "macos")]
 const LAUNCH_BIN_ENV: &str = "RTINFER_LAUNCH_BIN";
 
+#[cfg(target_os = "macos")]
 fn home() -> Result<PathBuf> {
     dirs_home().context("cannot resolve home directory")
 }
 
+#[cfg(target_os = "macos")]
 fn dirs_home() -> Option<PathBuf> {
     #[cfg(unix)]
     {
@@ -45,6 +53,7 @@ fn dirs_home() -> Option<PathBuf> {
 /// The stable npm global bin shim for `rtinferd`, if it can be located and
 /// exists. This is the path the LaunchAgent should pin so self-update is a
 /// no-op for the plist.
+#[cfg(target_os = "macos")]
 fn npm_global_shim() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os(LAUNCH_BIN_ENV) {
         // Trust the postinstall-provided path even if npm has not created the
@@ -65,6 +74,7 @@ fn npm_global_shim() -> Option<PathBuf> {
 
 /// Resolve the program path the LaunchAgent runs: prefer the stable npm shim,
 /// fall back to the current executable (dev / manual installs).
+#[cfg(target_os = "macos")]
 fn resolve_launch_program() -> Result<PathBuf> {
     if let Some(shim) = npm_global_shim() {
         return Ok(shim);
@@ -79,6 +89,7 @@ fn plist_path() -> Result<PathBuf> {
 }
 
 /// Render the LaunchAgent plist XML for `rtinferd serve --port <port>`.
+#[cfg(target_os = "macos")]
 pub fn render_plist(program: &Path, home: &Path, port: u16) -> String {
     let program_str = program.display();
     let log = home.join("Library/Logs/rtinferd.log");

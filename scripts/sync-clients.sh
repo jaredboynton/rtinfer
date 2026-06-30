@@ -29,7 +29,17 @@ PKG_JS="$ROOT/packages/js-wrapper/clients/rtinfer-client.mjs"
 PKG_PY="$ROOT/packages/js-wrapper/clients/rtinfer_client.py"
 
 CHECK=0
-[ "${1:-}" = "--check" ] && CHECK=1
+PACKAGE_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --check) CHECK=1 ;;
+    --package-only) PACKAGE_ONLY=1 ;;
+    *)
+      echo "usage: $0 [--check] [--package-only]" >&2
+      exit 2
+      ;;
+  esac
+done
 
 sync_one() {
   local src="$1" dst="$2"
@@ -53,6 +63,8 @@ sync_one() {
 rc=0
 sync_one "$JS_SRC" "$PKG_JS" || rc=1
 sync_one "$PY_SRC" "$PKG_PY" || rc=1
-[ -d "$CSE_TOOLS" ] && { sync_one "$JS_SRC" "$CSE_SWEEP_JS" || rc=1; }
-[ -d "$UNIFABLE" ] && { sync_one "$PY_SRC" "$UNIFABLE_PY" || rc=1; }
+if [ "$PACKAGE_ONLY" != "1" ]; then
+  [ -d "$CSE_TOOLS" ] && { sync_one "$JS_SRC" "$CSE_SWEEP_JS" || rc=1; }
+  [ -d "$UNIFABLE" ] && { sync_one "$PY_SRC" "$UNIFABLE_PY" || rc=1; }
+fi
 exit $rc
