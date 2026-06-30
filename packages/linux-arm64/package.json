@@ -3,8 +3,17 @@
   "version": "0.1.4",
   "description": "Linux arm64 binary for @jaredboynton/rtinfer",
   "license": "MIT",
-  "repository": "https://github.com/jaredboynton/rtinfer",
-  "os": ["linux"],
-  "cpu": ["arm64"],
-  "files": ["bin/rtinferd"]
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaredboynton/rtinfer.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin/rtinferd"
+  ]
 }

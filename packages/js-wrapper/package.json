@@ -3,8 +3,13 @@
   "version": "0.1.4",
   "description": "Always-on loopback rtinfer/1 inference daemon (gpt-realtime + codex/responses over Codex OAuth). Shared by cse-tools and unifable.",
   "license": "MIT",
-  "repository": "https://github.com/jaredboynton/rtinfer",
-  "engines": { "node": ">=18.0.0" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaredboynton/rtinfer.git"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "bin": {
     "rtinferd": "bin/rtinferd.js"
   },

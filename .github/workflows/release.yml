@@ -99,8 +99,12 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          npm publish packages/darwin-arm64 --access public
-          npm publish packages/linux-arm64 --access public
+          # Publish from inside each package dir so npm never mistakes the bare
+          # `packages/<name>` argument for a GitHub git shorthand (which would
+          # make it try `git ls-remote ssh://git@github.com/packages/<name>.git`
+          # and fail with exit 128).
+          (cd packages/darwin-arm64 && npm publish --access public)
+          (cd packages/linux-arm64 && npm publish --access public)
           # Meta package last so the latest dist-tag only advances once the
           # platform subpackages exist.
-          npm publish packages/js-wrapper --access public
+          (cd packages/js-wrapper && npm publish --access public)
