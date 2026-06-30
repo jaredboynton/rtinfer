@@ -70,6 +70,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/infer/health", get(rtinfer_health))
         .route("/v1/models", get(openai_models))
         .route("/v1/chat/completions", post(openai_chat_completions))
+        .route("/v1/responses", post(openai_responses))
         .with_state(state)
 }
 
@@ -149,6 +150,22 @@ struct OpenAiMessage {
     content: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+struct OpenAiResponsesRequest {
+    model: String,
+    input: Value,
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    reasoning: Option<OpenAiReasoning>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default, rename = "reasoningEffort")]
+    reasoning_effort_camel: Option<String>,
+}
+
 /// Build the rtinfer error envelope + HTTP status as a response.
 fn rtinfer_err(
     status: StatusCode,
@@ -207,20 +224,40 @@ fn normalize_reasoning_effort(effort: Option<&str>) -> Result<Option<String>, St
     }
 }
 
-fn request_reasoning_effort(req: &OpenAiChatRequest) -> Result<Option<String>, String> {
-    let requested = req
-        .reasoning
-        .as_ref()
+fn resolve_reasoning_effort(
+    model: &str,
+    reasoning: Option<&OpenAiReasoning>,
+    reasoning_effort: Option<&str>,
+    reasoning_effort_camel: Option<&str>,
+) -> Result<Option<String>, String> {
+    let requested = reasoning
         .and_then(|r| r.effort.as_deref())
-        .or(req.reasoning_effort.as_deref())
-        .or(req.reasoning_effort_camel.as_deref());
-    if req.model != REASONING_MODEL && requested.is_some() {
+        .or(reasoning_effort)
+        .or(reasoning_effort_camel);
+    if model != REASONING_MODEL && requested.is_some() {
         return Err(format!(
-            "reasoning is only supported for {REASONING_MODEL}, not {}",
-            req.model
+            "reasoning is only supported for {REASONING_MODEL}, not {model}"
         ));
     }
     normalize_reasoning_effort(requested)
+}
+
+fn request_reasoning_effort(req: &OpenAiChatRequest) -> Result<Option<String>, String> {
+    resolve_reasoning_effort(
+        &req.model,
+        req.reasoning.as_ref(),
+        req.reasoning_effort.as_deref(),
+        req.reasoning_effort_camel.as_deref(),
+    )
+}
+
+fn responses_reasoning_effort(req: &OpenAiResponsesRequest) -> Result<Option<String>, String> {
+    resolve_reasoning_effort(
+        &req.model,
+        req.reasoning.as_ref(),
+        req.reasoning_effort.as_deref(),
+        req.reasoning_effort_camel.as_deref(),
+    )
 }
 
 fn openai_content_text(content: &Option<Value>) -> Result<String, String> {
@@ -441,6 +478,193 @@ async fn openai_chat_completions(
     }
 }
 
+/// Flatten the Responses API `input` field (string or array of message items)
+/// into a single user-transcript string. `instructions` is handled separately
+/// as the system prompt.
+fn responses_input_to_text(input: &Value) -> Result<String, String> {
+    match input {
+        Value::String(s) => Ok(s.clone()),
+        Value::Array(items) => {
+            let mut out = String::new();
+            for item in items {
+                match item {
+                    Value::String(s) => out.push_str(s),
+                    Value::Object(obj) => {
+                        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("message");
+                        if kind != "message" {
+                            return Err(format!(
+                                "unsupported input item type {kind}; only message/text is supported"
+                            ));
+                        }
+                        let role = obj.get("role").and_then(Value::as_str).unwrap_or("user");
+                        let content = obj.get("content");
+                        let text = openai_content_text(&content.cloned())?;
+                        if !text.is_empty() {
+                            if !out.is_empty() {
+                                out.push_str("\n\n");
+                            }
+                            out.push_str(&format!("{role}: {text}"));
+                        }
+                    }
+                    _ => {
+                        return Err("unsupported input item; only message/text is supported".into())
+                    }
+                }
+            }
+            if out.is_empty() {
+                return Err("responses input must contain at least one non-empty message".into());
+            }
+            Ok(out)
+        }
+        _ => Err("unsupported input; only string or array of messages is supported".into()),
+    }
+}
+
+fn openai_responses_non_stream(model: &str, text: &str) -> Response {
+    let id = format!("resp_{}", now_secs());
+    let msg_id = format!("msg_{}", now_secs());
+    let message = json!({
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{ "type": "output_text", "text": text }],
+    });
+    Json(json!({
+        "id": id,
+        "object": "response",
+        "status": "completed",
+        "created_at": now_secs(),
+        "model": model,
+        "output": [message],
+        "output_text": text,
+        "usage": { "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 },
+    }))
+    .into_response()
+}
+
+fn openai_responses_stream(model: &str, text: &str) -> Response {
+    let id = format!("resp_{}", now_secs());
+    let msg_id = format!("msg_{}", now_secs());
+    let created_at = now_secs();
+    let message_in_progress = json!({
+        "id": msg_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []
+    });
+    let message_done = json!({
+        "id": msg_id, "type": "message", "role": "assistant", "status": "completed",
+        "content": [{ "type": "output_text", "text": text }]
+    });
+    let response_done = json!({
+        "id": id, "object": "response", "status": "completed", "created_at": created_at,
+        "model": model, "output": [message_done.clone()],
+        "usage": { "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 }
+    });
+    let events = [
+        (
+            "response.created",
+            json!({ "type": "response.created", "response": { "id": id, "object": "response", "status": "in_progress", "created_at": created_at, "model": model, "output": [] } }),
+        ),
+        (
+            "response.output_item.added",
+            json!({ "type": "response.output_item.added", "output_index": 0, "item": message_in_progress }),
+        ),
+        (
+            "response.content_part.added",
+            json!({ "type": "response.content_part.added", "output_index": 0, "content_index": 0, "part": { "type": "output_text", "text": "" } }),
+        ),
+        (
+            "response.output_text.delta",
+            json!({ "type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": text }),
+        ),
+        (
+            "response.output_text.done",
+            json!({ "type": "response.output_text.done", "output_index": 0, "content_index": 0, "text": text }),
+        ),
+        (
+            "response.content_part.done",
+            json!({ "type": "response.content_part.done", "output_index": 0, "content_index": 0, "part": { "type": "output_text", "text": text } }),
+        ),
+        (
+            "response.output_item.done",
+            json!({ "type": "response.output_item.done", "output_index": 0, "item": message_done }),
+        ),
+        (
+            "response.completed",
+            json!({ "type": "response.completed", "response": response_done }),
+        ),
+    ];
+    let mut body = String::new();
+    for (event, data) in &events {
+        body.push_str(&format!("event: {event}\ndata: {data}\n\n"));
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONNECTION, "keep-alive"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn openai_responses(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<OpenAiResponsesRequest>, JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(body) => body,
+        Err(e) => {
+            return openai_err(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                e.to_string(),
+            )
+        }
+    };
+    if !OPENAI_REALTIME_MODELS.contains(&req.model.as_str()) {
+        return openai_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "unsupported model {}; expected one of {}",
+                req.model,
+                OPENAI_REALTIME_MODELS.join(", ")
+            ),
+        );
+    }
+    let user = match responses_input_to_text(&req.input) {
+        Ok(text) => text,
+        Err(e) => return openai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    };
+    let system = req.instructions.clone().unwrap_or_default();
+    let reasoning_effort = match responses_reasoning_effort(&req) {
+        Ok(effort) => effort,
+        Err(e) => return openai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    };
+    match state
+        .warm_realtime
+        .ask_text(
+            &system,
+            &user,
+            Some(&req.model),
+            reasoning_effort.as_deref(),
+        )
+        .await
+    {
+        Ok(text) if req.stream => openai_responses_stream(&req.model, &text),
+        Ok(text) => openai_responses_non_stream(&req.model, &text),
+        Err(e) => {
+            tracing::warn!(model = %req.model, error = %e, "rtinfer: openai responses upstream error");
+            openai_err(
+                StatusCode::BAD_GATEWAY,
+                "provider_error",
+                format!("realtime upstream error: {}", e.code_or_label()),
+            )
+        }
+    }
+}
+
 async fn rtinfer(State(state): State<Arc<AppState>>, Json(req): Json<RtInferRequest>) -> Response {
     if !req.contract.is_empty() && req.contract != RTINFER_CONTRACT {
         return rtinfer_err(
@@ -555,6 +779,7 @@ mod tests {
         assert!(src.contains(r#".route("/v1/infer/health", get(rtinfer_health))"#));
         assert!(src.contains(r#".route("/v1/models", get(openai_models))"#));
         assert!(src.contains(r#".route("/v1/chat/completions", post(openai_chat_completions))"#));
+        assert!(src.contains(r#".route("/v1/responses", post(openai_responses))"#));
     }
 
     #[test]
@@ -631,6 +856,32 @@ mod tests {
         .unwrap();
         let err = request_reasoning_effort(&req).unwrap_err();
         assert!(err.contains("only supported for gpt-realtime-2"));
+    }
+
+    #[test]
+    fn responses_input_string_flattens_to_user_text() {
+        let text = responses_input_to_text(&json!("Say pong.")).unwrap();
+        assert_eq!(text, "Say pong.");
+    }
+
+    #[test]
+    fn responses_input_array_flattens_messages() {
+        let input = json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]},
+            {"type":"message","role":"assistant","content":"Hi there"}
+        ]);
+        let text = responses_input_to_text(&input).unwrap();
+        assert!(text.contains("user: Hello"));
+        assert!(text.contains("assistant: Hi there"));
+    }
+
+    #[test]
+    fn responses_input_rejects_non_message_items() {
+        let err = responses_input_to_text(&json!([
+            {"type":"function_call","name":"x","arguments":"{}"}
+        ]))
+        .unwrap_err();
+        assert!(err.contains("only message/text is supported"));
     }
 
     #[test]
