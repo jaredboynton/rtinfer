@@ -46,7 +46,7 @@ pub use responses::{
     CodexResponsesPool, CodexResponsesPoolBuilder, CODEX_RESPONSES_BETA, CODEX_RESPONSES_MODEL,
     CODEX_RESPONSES_ORIGINATOR, CODEX_RESPONSES_URL, CODEX_RESPONSES_USER_AGENT,
 };
-pub use warm::WarmSessionPool;
+pub use warm::{WarmSessionPool, WarmToolTurn};
 
 /// Default Realtime endpoint; identical to the JS reference.
 pub const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2";

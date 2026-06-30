@@ -43,7 +43,18 @@ use tokio::time::timeout;
 use tracing::debug;
 
 use crate::auth::SharedCodexAuthSource;
-use crate::{protocol, CodexAuth, RealtimeError, RealtimeTool, REALTIME_URL};
+use crate::{protocol, CodexAuth, RealtimeError, RealtimeTool, RealtimeToolCall, REALTIME_URL};
+
+/// One client-driven tool turn over a warm socket: any assistant text the model
+/// emitted plus the function calls it requested. Unlike the server-side tool loop
+/// ([`protocol::run_session_with_tools`]), the calls are NOT executed here — they
+/// are handed back to the caller (the OpenAI bridge) so the client runs them and
+/// loops, matching OpenAI's `finish_reason:"tool_calls"` contract.
+#[derive(Debug, Clone, Default)]
+pub struct WarmToolTurn {
+    pub text: String,
+    pub tool_calls: Vec<RealtimeToolCall>,
+}
 
 /// Reconnect a warm session open at least this long, before the server-side
 /// 60-minute Realtime cap forces a mid-ask close. Checked lazily at ask start.
@@ -302,6 +313,85 @@ impl WarmSession {
         }
     }
 
+    /// Run one client-driven tool turn on this socket, (re)connecting as needed.
+    /// Mirrors [`ask_text`](Self::ask_text)'s connect/refresh/retry handling but
+    /// dispatches caller `tools` and returns the model's function calls unexecuted.
+    async fn ask_tools(
+        &self,
+        auth_loader: &AuthLoader,
+        system: &str,
+        input_items: &[Value],
+        tools: &[RealtimeTool],
+        tool_choice: &str,
+        reasoning_effort: Option<&str>,
+    ) -> Result<WarmToolTurn, RealtimeError> {
+        let mut guard = self.inner.lock().await;
+
+        let need_connect = guard
+            .as_ref()
+            .map(|s| s.opened_at.elapsed() >= SESSION_MAX_AGE)
+            .unwrap_or(true);
+        if need_connect {
+            if let Some(old) = guard.take() {
+                let mut ws = old.ws;
+                let _ = protocol::graceful_close(&mut ws).await;
+            }
+            let auth = match auth_loader.load(false).await {
+                Ok(auth) => auth,
+                Err(e) => {
+                    self.sticky_repin_needed.store(true, Ordering::Relaxed);
+                    return Err(e);
+                }
+            };
+            match self.connect_and_prime(&auth).await {
+                Ok(live) => *guard = Some(live),
+                Err(e) if crate::responses::is_auth_handshake_error(&e) => {
+                    debug!(error = %e, "warm: auth rejected at handshake; refreshing + one retry");
+                    let auth2 = match auth_loader.load(true).await {
+                        Ok(auth) => auth,
+                        Err(e) => {
+                            self.sticky_repin_needed.store(true, Ordering::Relaxed);
+                            return Err(e);
+                        }
+                    };
+                    match self.connect_and_prime(&auth2).await {
+                        Ok(live) => *guard = Some(live),
+                        Err(e) => {
+                            self.sticky_repin_needed.store(true, Ordering::Relaxed);
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.sticky_repin_needed.store(true, Ordering::Relaxed);
+                    return Err(e);
+                }
+            }
+        }
+
+        let live = guard
+            .as_mut()
+            .ok_or_else(|| RealtimeError::Protocol("warm: no live socket after connect".into()))?;
+
+        match Self::run_tools(
+            &mut live.ws,
+            system,
+            input_items,
+            tools,
+            tool_choice,
+            reasoning_effort,
+        )
+        .await
+        {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                *guard = None;
+                self.sticky_repin_needed.store(true, Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
     async fn connect_and_prime(&self, auth: &CodexAuth) -> Result<LiveSocket, RealtimeError> {
         let (mut ws, _t0, connected_ms) =
             protocol::open_realtime_session(auth, &self.endpoint, None).await?;
@@ -414,6 +504,64 @@ impl WarmSession {
             }
         }
     }
+
+    /// Send one out-of-band `response.create` carrying caller-supplied `tools` +
+    /// `tool_choice` + a full reconstructed `input` array, and assemble the turn:
+    /// any assistant text plus the function calls the model requested. The calls
+    /// are returned to the caller unexecuted (client-driven loop).
+    async fn run_tools(
+        ws: &mut protocol::RealtimeWs,
+        system: &str,
+        input_items: &[Value],
+        tools: &[RealtimeTool],
+        tool_choice: &str,
+        reasoning_effort: Option<&str>,
+    ) -> Result<WarmToolTurn, RealtimeError> {
+        let frame = response_tools_frame(system, input_items, tools, tool_choice, reasoning_effort);
+        protocol::send_value(ws, &frame).await?;
+
+        let deadline = Instant::now() + ASK_WALL_CLOCK;
+        let mut text = String::new();
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| RealtimeError::Protocol("warm: ask wall clock timeout".into()))?;
+            let env = match timeout(remaining, protocol::next_envelope(ws)).await {
+                Ok(Ok(Some(env))) => env,
+                Ok(Ok(None)) => {
+                    return Err(RealtimeError::Protocol(
+                        "warm: socket closed mid-ask".into(),
+                    ))
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(RealtimeError::Protocol(
+                        "warm: ask wall clock timeout".into(),
+                    ))
+                }
+            };
+            match env.kind.as_str() {
+                "response.output_text.delta" => {
+                    if let Some(delta) = &env.delta {
+                        text.push_str(delta);
+                    }
+                }
+                "response.done" | "response.completed" => {
+                    let tool_calls = protocol::extract_tool_calls(&env)?;
+                    // Only fall back to done-text when no deltas streamed AND the
+                    // model produced no function call (a function_call item has no
+                    // text fields, so it never pollutes the text channel here).
+                    if text.is_empty() && tool_calls.is_empty() {
+                        text.push_str(&protocol::collect_done_text(&env));
+                    }
+                    return Ok(WarmToolTurn { text, tool_calls });
+                }
+                "response.failed" => return Err(protocol::provider_error_from(env.error)),
+                "error" => return Err(protocol::provider_error_from(env.error)),
+                _ => continue,
+            }
+        }
+    }
 }
 
 /// Build an out-of-band `response.create` frame (`conversation:"none"`) carrying
@@ -462,6 +610,36 @@ fn response_text_frame(system: &str, user: &str, reasoning_effort: Option<&str>)
             "role": "user",
             "content": [{ "type": "input_text", "text": user }],
         }],
+    });
+    if let Some(effort) = reasoning_effort {
+        let effort = effort.trim().to_lowercase();
+        if matches!(
+            effort.as_str(),
+            "none" | "minimal" | "low" | "medium" | "high"
+        ) {
+            response["reasoning"] = json!({ "effort": effort });
+        }
+    }
+    json!({ "type": "response.create", "response": response })
+}
+
+/// Build an out-of-band `response.create` carrying caller `tools` + `tool_choice`
+/// and a full reconstructed `input` array (multi-turn history rides on each
+/// request). Powers the OpenAI-compatible bridge's client-driven tool loop.
+fn response_tools_frame(
+    system: &str,
+    input_items: &[Value],
+    tools: &[RealtimeTool],
+    tool_choice: &str,
+    reasoning_effort: Option<&str>,
+) -> Value {
+    let mut response = json!({
+        "conversation": "none",
+        "output_modalities": ["text"],
+        "instructions": system,
+        "tools": tools,
+        "tool_choice": tool_choice,
+        "input": input_items,
     });
     if let Some(effort) = reasoning_effort {
         let effort = effort.trim().to_lowercase();
@@ -608,6 +786,36 @@ impl WarmSessionPool {
         session.load.fetch_add(1, Ordering::Relaxed);
         let out = session
             .ask_text(&self.auth, system, user, reasoning_effort)
+            .await;
+        session.load.fetch_sub(1, Ordering::Relaxed);
+        out
+    }
+
+    /// One client-driven tool turn over a warm socket for `model` (None = pool
+    /// default). Used by the OpenAI-compatible chat/responses endpoints to drive a
+    /// stateless agentic loop: caller `tools` + reconstructed `input_items` go up,
+    /// the model's function calls come back unexecuted for the client to run.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ask_tools(
+        &self,
+        system: &str,
+        input_items: &[Value],
+        tools: &[RealtimeTool],
+        tool_choice: &str,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<WarmToolTurn, RealtimeError> {
+        let session = self.pick(model, system).await;
+        session.load.fetch_add(1, Ordering::Relaxed);
+        let out = session
+            .ask_tools(
+                &self.auth,
+                system,
+                input_items,
+                tools,
+                tool_choice,
+                reasoning_effort,
+            )
             .await;
         session.load.fetch_sub(1, Ordering::Relaxed);
         out
@@ -771,6 +979,24 @@ mod tests {
     fn text_frame_drops_unknown_reasoning_effort() {
         let f = response_text_frame("SYS", "hello", Some("xhigh"));
         assert!(f["response"].get("reasoning").is_none());
+    }
+
+    #[test]
+    fn tools_frame_carries_tools_choice_and_input() {
+        let tool = RealtimeTool::function("get_weather", "Get weather", json!({"type":"object"}));
+        let input = vec![json!({
+            "type": "message", "role": "user",
+            "content": [{ "type": "input_text", "text": "weather in SF?" }],
+        })];
+        let f = response_tools_frame("SYS", &input, &[tool], "auto", Some("high"));
+        assert_eq!(f["type"], "response.create");
+        let r = &f["response"];
+        assert_eq!(r["conversation"], "none");
+        assert_eq!(r["instructions"], "SYS");
+        assert_eq!(r["tool_choice"], "auto");
+        assert_eq!(r["tools"][0]["name"], "get_weather");
+        assert_eq!(r["input"][0]["content"][0]["text"], "weather in SF?");
+        assert_eq!(r["reasoning"]["effort"], "high");
     }
 
     #[tokio::test]

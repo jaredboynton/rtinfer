@@ -22,7 +22,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rtinfer_core::{CodexResponsesPool, WarmSessionPool};
+use rtinfer_core::{CodexResponsesPool, RealtimeTool, WarmSessionPool, WarmToolTurn};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::info;
@@ -135,6 +135,10 @@ struct OpenAiChatRequest {
     reasoning_effort: Option<String>,
     #[serde(default, rename = "reasoningEffort")]
     reasoning_effort_camel: Option<String>,
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
+    #[serde(default)]
+    tool_choice: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,11 +147,18 @@ struct OpenAiReasoning {
     effort: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct OpenAiMessage {
     role: String,
     #[serde(default)]
     content: Option<Value>,
+    /// Assistant turns replayed by the client carry the tool calls the model
+    /// previously requested (OpenAI Chat shape: `{id, function:{name, arguments}}`).
+    #[serde(default)]
+    tool_calls: Option<Vec<Value>>,
+    /// `role:"tool"` turns carry the id of the call they answer.
+    #[serde(default)]
+    tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +175,10 @@ struct OpenAiResponsesRequest {
     reasoning_effort: Option<String>,
     #[serde(default, rename = "reasoningEffort")]
     reasoning_effort_camel: Option<String>,
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
+    #[serde(default)]
+    tool_choice: Option<Value>,
 }
 
 /// Build the rtinfer error envelope + HTTP status as a response.
@@ -319,6 +334,219 @@ fn openai_messages_to_prompt(messages: &[OpenAiMessage]) -> Result<(String, Stri
     Ok((system_parts.join("\n\n"), transcript_parts.join("\n\n")))
 }
 
+// ---------------------------------------------------------------------------
+// Tool-calling bridge: OpenAI tool/message shapes <-> Realtime out-of-band items
+// ---------------------------------------------------------------------------
+
+/// Translate OpenAI tool definitions into `RealtimeTool`. `nested` selects the
+/// Chat Completions shape (`{type:"function", function:{name, ...}}`) vs the flat
+/// Responses shape (`{type:"function", name, ...}`).
+fn parse_openai_tools(tools: &[Value], nested: bool) -> Result<Vec<RealtimeTool>, String> {
+    let mut out = Vec::with_capacity(tools.len());
+    for t in tools {
+        let spec = if nested {
+            t.get("function").unwrap_or(t)
+        } else {
+            t
+        };
+        let name = spec
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or("tool definition missing function name")?;
+        let description = spec
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let parameters = spec
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+        out.push(RealtimeTool::function(name, description, parameters));
+    }
+    Ok(out)
+}
+
+/// Map an OpenAI `tool_choice` onto the Realtime `tool_choice` string. Forcing a
+/// specific function (object form) maps to `"required"`; `auto` is the default.
+fn parse_tool_choice(choice: Option<&Value>) -> String {
+    match choice {
+        Some(Value::String(s)) if matches!(s.as_str(), "auto" | "none" | "required") => s.clone(),
+        Some(Value::Object(_)) => "required".to_string(),
+        _ => "auto".to_string(),
+    }
+}
+
+/// One Realtime `message` input item. Non-user text is labelled (`assistant: ...`)
+/// and carried as a user-role `input_text` part — the proven flatten convention,
+/// which sidesteps Realtime's stricter assistant-content typing while keeping the
+/// turn legible to the model.
+fn realtime_text_item(role: &str, text: &str) -> Value {
+    let labelled = if role == "user" {
+        text.to_string()
+    } else {
+        format!("{role}: {text}")
+    };
+    json!({
+        "type": "message",
+        "role": "user",
+        "content": [{ "type": "input_text", "text": labelled }],
+    })
+}
+
+/// Build a Realtime `function_call` item from an OpenAI Chat `tool_calls` entry.
+fn realtime_function_call_from_chat(call: &Value) -> Result<Value, String> {
+    let call_id = call.get("id").and_then(Value::as_str).unwrap_or("");
+    let func = call
+        .get("function")
+        .ok_or("tool_call missing function object")?;
+    let name = func
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("tool_call missing function name")?;
+    let arguments = func
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or("{}");
+    Ok(json!({
+        "type": "function_call",
+        "name": name,
+        "call_id": call_id,
+        "arguments": arguments,
+    }))
+}
+
+/// Reconstruct the Realtime out-of-band `input` array from a Chat message list,
+/// returning the flattened system prompt plus the interleaved items (text turns,
+/// `function_call`, `function_call_output`).
+fn chat_messages_to_realtime(messages: &[OpenAiMessage]) -> Result<(String, Vec<Value>), String> {
+    let mut system_parts = Vec::new();
+    let mut items: Vec<Value> = Vec::new();
+    for msg in messages {
+        let role = msg.role.trim().to_ascii_lowercase();
+        match role.as_str() {
+            "system" | "developer" => {
+                let text = openai_content_text(&msg.content)?;
+                if !text.is_empty() {
+                    system_parts.push(text);
+                }
+            }
+            "user" => {
+                let text = openai_content_text(&msg.content)?;
+                if !text.is_empty() {
+                    items.push(realtime_text_item("user", &text));
+                }
+            }
+            "assistant" => {
+                let text = openai_content_text(&msg.content)?;
+                if !text.is_empty() {
+                    items.push(realtime_text_item("assistant", &text));
+                }
+                if let Some(calls) = &msg.tool_calls {
+                    for call in calls {
+                        items.push(realtime_function_call_from_chat(call)?);
+                    }
+                }
+            }
+            "tool" => {
+                let call_id = msg
+                    .tool_call_id
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .ok_or("tool message missing tool_call_id")?;
+                let output = openai_content_text(&msg.content)?;
+                items.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                }));
+            }
+            other => return Err(format!("unsupported message role {other}")),
+        }
+    }
+    if items.is_empty() {
+        return Err("messages must contain at least one non-empty user/assistant turn".into());
+    }
+    Ok((system_parts.join("\n\n"), items))
+}
+
+/// Coerce a `function_call_output` `output` field (string, or any JSON value) to
+/// the string Realtime expects.
+fn function_output_to_string(obj: &serde_json::Map<String, Value>) -> String {
+    match obj.get("output") {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Reconstruct the Realtime out-of-band `input` array from a Responses `input`
+/// field, accepting `message`, `function_call`, and `function_call_output` items.
+fn responses_input_to_realtime(input: &Value) -> Result<Vec<Value>, String> {
+    match input {
+        Value::String(s) => Ok(vec![realtime_text_item("user", s)]),
+        Value::Array(arr) => {
+            let mut items = Vec::new();
+            for it in arr {
+                match it {
+                    Value::String(s) => items.push(realtime_text_item("user", s)),
+                    Value::Object(obj) => {
+                        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("message");
+                        match kind {
+                            "message" => {
+                                let role = obj.get("role").and_then(Value::as_str).unwrap_or("user");
+                                let text = openai_content_text(&obj.get("content").cloned())?;
+                                if !text.is_empty() {
+                                    items.push(realtime_text_item(role, &text));
+                                }
+                            }
+                            "function_call" => {
+                                let name = obj
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                    .ok_or("function_call item missing name")?;
+                                let call_id =
+                                    obj.get("call_id").and_then(Value::as_str).unwrap_or("");
+                                let arguments =
+                                    obj.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                                items.push(json!({
+                                    "type": "function_call",
+                                    "name": name,
+                                    "call_id": call_id,
+                                    "arguments": arguments,
+                                }));
+                            }
+                            "function_call_output" => {
+                                let call_id =
+                                    obj.get("call_id").and_then(Value::as_str).unwrap_or("");
+                                items.push(json!({
+                                    "type": "function_call_output",
+                                    "call_id": call_id,
+                                    "output": function_output_to_string(obj),
+                                }));
+                            }
+                            other => {
+                                return Err(format!(
+                                    "unsupported input item type {other}; expected message/function_call/function_call_output"
+                                ))
+                            }
+                        }
+                    }
+                    _ => return Err("unsupported input item; expected string or object".into()),
+                }
+            }
+            if items.is_empty() {
+                return Err("responses input must contain at least one non-empty item".into());
+            }
+            Ok(items)
+        }
+        _ => Err("unsupported input; only string or array of items is supported".into()),
+    }
+}
+
 async fn openai_models() -> Response {
     Json(json!({
         "object": "list",
@@ -373,6 +601,81 @@ fn openai_chat_stream_response(model: &str, text: &str) -> Response {
         "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
     });
     let body = format!("data: {start}\n\ndata: {delta}\n\ndata: {stop}\n\ndata: [DONE]\n\n");
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONNECTION, "keep-alive"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// Chat `tool_calls` array (`{index, id, type, function:{name, arguments}}`) from
+/// a Realtime tool turn.
+fn chat_tool_calls_json(turn: &WarmToolTurn) -> Vec<Value> {
+    turn.tool_calls
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            json!({
+                "index": i,
+                "id": c.call_id,
+                "type": "function",
+                "function": { "name": c.name, "arguments": c.arguments_raw },
+            })
+        })
+        .collect()
+}
+
+/// Non-streaming Chat completion carrying tool calls. Falls back to the plain
+/// text response when the model returned no calls.
+fn openai_chat_tool_response(model: &str, turn: &WarmToolTurn) -> Response {
+    if turn.tool_calls.is_empty() {
+        return openai_chat_response(model, &turn.text);
+    }
+    let mut message = json!({ "role": "assistant", "content": Value::Null });
+    if !turn.text.is_empty() {
+        message["content"] = json!(turn.text);
+    }
+    message["tool_calls"] = json!(chat_tool_calls_json(turn));
+    Json(json!({
+        "id": openai_message_id(),
+        "object": "chat.completion",
+        "created": now_secs(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": "tool_calls",
+        }],
+        "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 },
+    }))
+    .into_response()
+}
+
+/// Streaming Chat completion carrying tool calls. Falls back to the plain text
+/// stream when the model returned no calls.
+fn openai_chat_tool_stream_response(model: &str, turn: &WarmToolTurn) -> Response {
+    if turn.tool_calls.is_empty() {
+        return openai_chat_stream_response(model, &turn.text);
+    }
+    let id = openai_message_id();
+    let created = now_secs();
+    let start = json!({
+        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+        "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
+    });
+    let tool_delta = json!({
+        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+        "choices": [{ "index": 0, "delta": { "tool_calls": chat_tool_calls_json(turn) }, "finish_reason": null }],
+    });
+    let stop = json!({
+        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
+    });
+    let body = format!("data: {start}\n\ndata: {tool_delta}\n\ndata: {stop}\n\ndata: [DONE]\n\n");
     (
         [
             (header::CONTENT_TYPE, "text/event-stream"),
@@ -447,12 +750,51 @@ async fn openai_chat_completions(
             "messages must not be empty",
         );
     }
-    let (system, user) = match openai_messages_to_prompt(&req.messages) {
-        Ok(prompt) => prompt,
-        Err(e) => return openai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
-    };
     let reasoning_effort = match request_reasoning_effort(&req) {
         Ok(effort) => effort,
+        Err(e) => return openai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    };
+
+    // Tool-calling path: declare the client's tools to the Realtime session and
+    // hand back the function calls it requests (client executes + loops).
+    let tools = req.tools.clone().unwrap_or_default();
+    if !tools.is_empty() {
+        let realtime_tools = match parse_openai_tools(&tools, true) {
+            Ok(t) => t,
+            Err(e) => return openai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+        };
+        let tool_choice = parse_tool_choice(req.tool_choice.as_ref());
+        let (system, items) = match chat_messages_to_realtime(&req.messages) {
+            Ok(parts) => parts,
+            Err(e) => return openai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+        };
+        return match state
+            .warm_realtime
+            .ask_tools(
+                &system,
+                &items,
+                &realtime_tools,
+                &tool_choice,
+                Some(&req.model),
+                reasoning_effort.as_deref(),
+            )
+            .await
+        {
+            Ok(turn) if req.stream => openai_chat_tool_stream_response(&req.model, &turn),
+            Ok(turn) => openai_chat_tool_response(&req.model, &turn),
+            Err(e) => {
+                tracing::warn!(model = %req.model, error = %e, "rtinfer: openai chat tool upstream error");
+                openai_err(
+                    StatusCode::BAD_GATEWAY,
+                    "provider_error",
+                    format!("realtime upstream error: {}", e.code_or_label()),
+                )
+            }
+        };
+    }
+
+    let (system, user) = match openai_messages_to_prompt(&req.messages) {
+        Ok(prompt) => prompt,
         Err(e) => return openai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
     };
     match state
@@ -608,6 +950,97 @@ fn openai_responses_stream(model: &str, text: &str) -> Response {
         .into_response()
 }
 
+/// Responses `function_call` output items from a Realtime tool turn.
+fn responses_function_call_items(turn: &WarmToolTurn) -> Vec<Value> {
+    turn.tool_calls
+        .iter()
+        .map(|c| {
+            json!({
+                "id": format!("fc_{}", c.call_id),
+                "type": "function_call",
+                "call_id": c.call_id,
+                "name": c.name,
+                "arguments": c.arguments_raw,
+                "status": "completed",
+            })
+        })
+        .collect()
+}
+
+/// Non-streaming Responses payload carrying `function_call` output items. Falls
+/// back to the plain message response when the model returned no calls.
+fn openai_responses_tool_non_stream(model: &str, turn: &WarmToolTurn) -> Response {
+    if turn.tool_calls.is_empty() {
+        return openai_responses_non_stream(model, &turn.text);
+    }
+    let mut output = Vec::new();
+    if !turn.text.is_empty() {
+        output.push(json!({
+            "id": format!("msg_{}", now_secs()),
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{ "type": "output_text", "text": turn.text }],
+        }));
+    }
+    output.extend(responses_function_call_items(turn));
+    Json(json!({
+        "id": format!("resp_{}", now_secs()),
+        "object": "response",
+        "status": "completed",
+        "created_at": now_secs(),
+        "model": model,
+        "output": output,
+        "usage": { "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 },
+    }))
+    .into_response()
+}
+
+/// Streaming Responses payload carrying `function_call` output items. Falls back
+/// to the plain text stream when the model returned no calls.
+fn openai_responses_tool_stream(model: &str, turn: &WarmToolTurn) -> Response {
+    if turn.tool_calls.is_empty() {
+        return openai_responses_stream(model, &turn.text);
+    }
+    let id = format!("resp_{}", now_secs());
+    let created_at = now_secs();
+    let items = responses_function_call_items(turn);
+    let mut body = String::new();
+    let created = json!({
+        "type": "response.created",
+        "response": { "id": id, "object": "response", "status": "in_progress", "created_at": created_at, "model": model, "output": [] },
+    });
+    body.push_str(&format!("event: response.created\ndata: {created}\n\n"));
+    for (idx, item) in items.iter().enumerate() {
+        let added =
+            json!({ "type": "response.output_item.added", "output_index": idx, "item": item });
+        body.push_str(&format!(
+            "event: response.output_item.added\ndata: {added}\n\n"
+        ));
+        let done =
+            json!({ "type": "response.output_item.done", "output_index": idx, "item": item });
+        body.push_str(&format!(
+            "event: response.output_item.done\ndata: {done}\n\n"
+        ));
+    }
+    let response_done = json!({
+        "id": id, "object": "response", "status": "completed", "created_at": created_at,
+        "model": model, "output": items,
+        "usage": { "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 },
+    });
+    let completed = json!({ "type": "response.completed", "response": response_done });
+    body.push_str(&format!("event: response.completed\ndata: {completed}\n\n"));
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONNECTION, "keep-alive"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 async fn openai_responses(
     State(state): State<Arc<AppState>>,
     body: Result<Json<OpenAiResponsesRequest>, JsonRejection>,
@@ -633,13 +1066,52 @@ async fn openai_responses(
             ),
         );
     }
-    let user = match responses_input_to_text(&req.input) {
-        Ok(text) => text,
-        Err(e) => return openai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
-    };
     let system = req.instructions.clone().unwrap_or_default();
     let reasoning_effort = match responses_reasoning_effort(&req) {
         Ok(effort) => effort,
+        Err(e) => return openai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    };
+
+    // Tool-calling path: declare tools, replay any prior function-call turns, and
+    // hand back the function calls the model requests.
+    let tools = req.tools.clone().unwrap_or_default();
+    if !tools.is_empty() {
+        let realtime_tools = match parse_openai_tools(&tools, false) {
+            Ok(t) => t,
+            Err(e) => return openai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+        };
+        let tool_choice = parse_tool_choice(req.tool_choice.as_ref());
+        let items = match responses_input_to_realtime(&req.input) {
+            Ok(items) => items,
+            Err(e) => return openai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+        };
+        return match state
+            .warm_realtime
+            .ask_tools(
+                &system,
+                &items,
+                &realtime_tools,
+                &tool_choice,
+                Some(&req.model),
+                reasoning_effort.as_deref(),
+            )
+            .await
+        {
+            Ok(turn) if req.stream => openai_responses_tool_stream(&req.model, &turn),
+            Ok(turn) => openai_responses_tool_non_stream(&req.model, &turn),
+            Err(e) => {
+                tracing::warn!(model = %req.model, error = %e, "rtinfer: openai responses tool upstream error");
+                openai_err(
+                    StatusCode::BAD_GATEWAY,
+                    "provider_error",
+                    format!("realtime upstream error: {}", e.code_or_label()),
+                )
+            }
+        };
+    }
+
+    let user = match responses_input_to_text(&req.input) {
+        Ok(text) => text,
         Err(e) => return openai_err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
     };
     match state
@@ -890,20 +1362,24 @@ mod tests {
             OpenAiMessage {
                 role: "system".into(),
                 content: Some(Value::String("You are strict".into())),
+                ..Default::default()
             },
             OpenAiMessage {
                 role: "developer".into(),
                 content: Some(Value::Array(vec![
                     json!({"type":"text","text":"Follow policy"}),
                 ])),
+                ..Default::default()
             },
             OpenAiMessage {
                 role: "user".into(),
                 content: Some(Value::String("Question".into())),
+                ..Default::default()
             },
             OpenAiMessage {
                 role: "assistant".into(),
                 content: Some(Value::String("Prior answer".into())),
+                ..Default::default()
             },
         ])
         .unwrap();
@@ -918,6 +1394,7 @@ mod tests {
             content: Some(Value::Array(vec![
                 json!({"type":"image_url","image_url":{"url":"x"}}),
             ])),
+            ..Default::default()
         }])
         .unwrap_err();
         assert!(err.contains("only text is supported"));
@@ -939,8 +1416,142 @@ mod tests {
         let err = openai_messages_to_prompt(&[OpenAiMessage {
             role: "system".into(),
             content: Some(Value::String("Rules".into())),
+            ..Default::default()
         }])
         .unwrap_err();
         assert!(err.contains("at least one non-empty user/assistant turn"));
+    }
+
+    #[test]
+    fn parse_tools_handles_chat_nested_and_responses_flat() {
+        let chat = json!([{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type":"object","properties":{"city":{"type":"string"}}},
+            },
+        }]);
+        let nested = parse_openai_tools(chat.as_array().unwrap(), true).unwrap();
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].name, "get_weather");
+        assert_eq!(nested[0].parameters["properties"]["city"]["type"], "string");
+
+        let flat = json!([{
+            "type": "function",
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {"type":"object"},
+        }]);
+        let flat = parse_openai_tools(flat.as_array().unwrap(), false).unwrap();
+        assert_eq!(flat[0].name, "get_weather");
+    }
+
+    #[test]
+    fn parse_tools_rejects_missing_name() {
+        let bad = json!([{ "type": "function", "function": { "description": "x" } }]);
+        assert!(parse_openai_tools(bad.as_array().unwrap(), true).is_err());
+    }
+
+    #[test]
+    fn tool_choice_maps_string_and_object_forms() {
+        assert_eq!(parse_tool_choice(Some(&json!("auto"))), "auto");
+        assert_eq!(parse_tool_choice(Some(&json!("none"))), "none");
+        assert_eq!(parse_tool_choice(Some(&json!("required"))), "required");
+        assert_eq!(
+            parse_tool_choice(Some(&json!({"type":"function","function":{"name":"x"}}))),
+            "required"
+        );
+        assert_eq!(parse_tool_choice(None), "auto");
+    }
+
+    #[test]
+    fn chat_history_reconstructs_tool_round_trip() {
+        let messages = vec![
+            OpenAiMessage {
+                role: "system".into(),
+                content: Some(Value::String("Be terse".into())),
+                ..Default::default()
+            },
+            OpenAiMessage {
+                role: "user".into(),
+                content: Some(Value::String("weather in SF?".into())),
+                ..Default::default()
+            },
+            OpenAiMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: Some(vec![json!({
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{\"city\":\"SF\"}" },
+                })]),
+                tool_call_id: None,
+            },
+            OpenAiMessage {
+                role: "tool".into(),
+                content: Some(Value::String("{\"temp\":62}".into())),
+                tool_call_id: Some("call_1".into()),
+                ..Default::default()
+            },
+        ];
+        let (system, items) = chat_messages_to_realtime(&messages).unwrap();
+        assert_eq!(system, "Be terse");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["content"][0]["text"], "weather in SF?");
+        assert_eq!(items[1]["type"], "function_call");
+        assert_eq!(items[1]["name"], "get_weather");
+        assert_eq!(items[1]["call_id"], "call_1");
+        assert_eq!(items[2]["type"], "function_call_output");
+        assert_eq!(items[2]["call_id"], "call_1");
+        assert_eq!(items[2]["output"], "{\"temp\":62}");
+    }
+
+    #[test]
+    fn responses_input_accepts_function_call_items() {
+        let input = json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+            {"type":"function_call","name":"f","call_id":"c1","arguments":"{}"},
+            {"type":"function_call_output","call_id":"c1","output":"done"},
+        ]);
+        let items = responses_input_to_realtime(&input).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1]["type"], "function_call");
+        assert_eq!(items[2]["type"], "function_call_output");
+        assert_eq!(items[2]["output"], "done");
+    }
+
+    fn turn_with_call() -> WarmToolTurn {
+        WarmToolTurn {
+            text: String::new(),
+            tool_calls: vec![rtinfer_core::RealtimeToolCall {
+                name: "get_weather".into(),
+                call_id: "call_1".into(),
+                arguments: json!({"city":"SF"}),
+                arguments_raw: "{\"city\":\"SF\"}".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn chat_tool_response_sets_finish_reason_and_tool_calls() {
+        let turn = turn_with_call();
+        let calls = chat_tool_calls_json(&turn);
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"SF\"}");
+        // Builder returns a 200 with the tool_calls choice.
+        let resp = openai_chat_tool_response("gpt-realtime-2", &turn);
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn responses_tool_items_are_function_calls() {
+        let items = responses_function_call_items(&turn_with_call());
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["name"], "get_weather");
+        assert_eq!(items[0]["call_id"], "call_1");
+        assert_eq!(items[0]["status"], "completed");
     }
 }
