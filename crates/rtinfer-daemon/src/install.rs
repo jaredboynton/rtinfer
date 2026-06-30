@@ -33,6 +33,12 @@ pub const LABEL: &str = "com.jaredboynton.rtinferd";
 #[cfg(target_os = "macos")]
 const LAUNCH_BIN_ENV: &str = "RTINFER_LAUNCH_BIN";
 
+/// Explicit node interpreter path (set by the npm postinstall to
+/// `process.execPath`). Most reliable node for the launchd plist because
+/// launchd does not inherit the user's shell PATH (fnm/nvm shims are absent).
+#[cfg(target_os = "macos")]
+const LAUNCH_NODE_ENV: &str = "RTINFER_LAUNCH_NODE";
+
 #[cfg(target_os = "macos")]
 fn home() -> Result<PathBuf> {
     dirs_home().context("cannot resolve home directory")
@@ -81,6 +87,14 @@ fn npm_global_shim() -> Option<PathBuf> {
 /// Returns None if node cannot be resolved (non-shim installs don't need it).
 #[cfg(target_os = "macos")]
 fn resolve_node_bin() -> Option<PathBuf> {
+    // Most reliable: the exact node the npm postinstall ran under
+    // (`process.execPath`), handed through the environment.
+    if let Some(node) = std::env::var_os(LAUNCH_NODE_ENV) {
+        let p = PathBuf::from(&node);
+        if p.exists() {
+            return Some(p.canonicalize().unwrap_or(p));
+        }
+    }
     // Prefer the node running THIS process (works for npm lifecycle scripts
     // where npm sets the real node path in the environment).
     if let Some(node) = std::env::var_os("NODE") {
@@ -95,19 +109,31 @@ fn resolve_node_bin() -> Option<PathBuf> {
         }
     }
     // Fall back to `which node` via the user's shell.
-    let out = Command::new("sh")
+    if let Some(out) = Command::new("sh")
         .args(["-lc", "command -v node"])
         .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+        .ok()
+        .filter(|o| o.status.success())
+    {
+        let node = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let p = PathBuf::from(&node);
+        if !node.is_empty() && p.exists() {
+            return Some(p.canonicalize().unwrap_or(p));
+        }
     }
-    let node = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if node.is_empty() {
-        return None;
+    // Last resort: scan stable, version-manager-independent locations that
+    // survive an fnm version switch/GC.
+    for cand in [
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+        "/usr/bin/node",
+    ] {
+        let p = PathBuf::from(cand);
+        if p.exists() {
+            return Some(p);
+        }
     }
-    let node_path = PathBuf::from(&node);
-    node_path.exists().then_some(node_path)
+    None
 }
 
 /// Resolve the program path the LaunchAgent runs: prefer the stable npm shim,
@@ -162,12 +188,17 @@ pub fn render_plist(program: &Path, home: &Path, port: u16, node_bin: Option<&Pa
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         let current_path = std::env::var("PATH").unwrap_or_default();
-        // Prepend the node dir to the existing PATH so launchd finds node.
-        let path_val = if current_path.is_empty() {
-            node_dir.clone()
-        } else {
-            format!("{node_dir}:{current_path}")
-        };
+        // Prepend the node dir, then append stable fallbacks that survive an
+        // fnm version switch/GC, so the shim's child processes find node even
+        // if the version-specific node dir later disappears.
+        let mut parts: Vec<String> = vec![node_dir];
+        if !current_path.is_empty() {
+            parts.push(current_path);
+        }
+        parts.push("/opt/homebrew/bin".to_string());
+        parts.push("/usr/local/bin".to_string());
+        parts.push("/usr/bin".to_string());
+        let path_val = parts.join(":");
         format!(
             "    <key>EnvironmentVariables</key>\n    <dict>\n        <key>PATH</key>\n        <string>{path_val}</string>\n    </dict>\n"
         )
@@ -204,12 +235,130 @@ pub fn render_plist(program: &Path, home: &Path, port: u16, node_bin: Option<&Pa
     )
 }
 
+/// Detect whether `program` is the npm JS shim (needs a node interpreter) vs a
+/// native binary. Checks for a real `#!/usr/bin/env node` shebang or a `.js`
+/// extension rather than a loose substring match.
+#[cfg(target_os = "macos")]
+fn is_node_shim(program: &Path) -> bool {
+    if program.extension() == Some(std::ffi::OsStr::new("js")) {
+        return true;
+    }
+    if let Ok(head) = std::fs::read_to_string(program) {
+        let first = head.lines().next().unwrap_or_default();
+        return first.starts_with("#!") && first.contains("node");
+    }
+    false
+}
+
+/// True if a process with `pid` is currently alive.
+#[cfg(target_os = "macos")]
+fn pid_alive(pid: u32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // Signal 0 performs error checking without sending a signal.
+    unsafe { kill(pid as i32, 0) == 0 }
+}
+
+/// Send a signal to `pid`, ignoring the result.
+#[cfg(target_os = "macos")]
+fn signal(pid: u32, sig: i32) {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe {
+        let _ = kill(pid as i32, sig);
+    }
+}
+
+/// Best-effort: find PIDs listening on the loopback `port` via `lsof`.
+#[cfg(target_os = "macos")]
+fn pids_on_port(port: u16) -> Vec<u32> {
+    let out = Command::new("lsof")
+        .args(["-ti", &format!("tcp:{port}"), "-sTCP:LISTEN"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .filter_map(|s| s.parse::<u32>().ok())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Drain a running daemon `pid`: SIGTERM, poll up to ~5s for exit, then SIGKILL.
+#[cfg(target_os = "macos")]
+fn drain_pid(pid: u32) {
+    const SIGTERM: i32 = 15;
+    const SIGKILL: i32 = 9;
+    if !pid_alive(pid) {
+        return;
+    }
+    signal(pid, SIGTERM);
+    for _ in 0..50 {
+        if !pid_alive(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    signal(pid, SIGKILL);
+    for _ in 0..30 {
+        if !pid_alive(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Poll until `127.0.0.1:port` can be bound (the previous holder fully released
+/// it). Returns true if free within the timeout.
+#[cfg(target_os = "macos")]
+fn wait_port_free(port: u16) -> bool {
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    for _ in 0..60 {
+        match TcpListener::bind(addr) {
+            Ok(l) => {
+                drop(l);
+                return true;
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+    false
+}
+
 /// Install + load the LaunchAgent, pinned to the stable npm global shim (or the
-/// current binary as a dev/manual fallback). Idempotent: if the agent is already
-/// loaded, it is first fully unloaded (bootout) before re-bootstrapping so no
-/// duplicate entries accumulate across re-installs / re-installs.
+/// current binary as a dev/manual fallback).
+///
+/// Intelligent replace: serialized by a single-flight lock, it detects every
+/// holder of `port` (the launchd job, the pid in the endpoint file, and any
+/// `lsof` listener), drains them, waits for the port to free, then bootstraps
+/// exactly one LaunchAgent entry. No duplicates accumulate across re-installs,
+/// and a stray debug/manual `rtinferd serve` is cleanly superseded.
 #[cfg(target_os = "macos")]
 pub fn run_install(port: u16) -> Result<()> {
+    // A debug build must never become the system LaunchAgent (it self-isolates
+    // on port 8766 and skips self-update); installing one would pin a
+    // throwaway target into the plist.
+    if cfg!(debug_assertions) {
+        anyhow::bail!(
+            "refusing to install a debug build as a LaunchAgent; build with --release or install via npm"
+        );
+    }
+
+    // Single-flight: serialize against a concurrent self-update `npm i -g`
+    // (whose postinstall also runs `rtinferd install`). Fail-open if the lock
+    // cannot be set up; back off if another install holds it.
+    let _lock = match crate::lock::try_acquire() {
+        Ok(Some(g)) => Some(g),
+        Ok(None) => {
+            eprintln!("rtinferd install: another install is in progress; skipping");
+            return Ok(());
+        }
+        Err(()) => None,
+    };
+
     let program = resolve_launch_program()?;
     let home = home()?;
     let plist = plist_path()?;
@@ -217,12 +366,40 @@ pub fn run_install(port: u16) -> Result<()> {
     // Resolve the node interpreter when the program is an npm shim. launchd
     // does not inherit the shell PATH, so `#!/usr/bin/env node` fails without
     // an explicit interpreter in ProgramArguments.
-    let is_shim = program.is_file()
-        && std::fs::read_to_string(&program)
-            .ok()
-            .map(|head| head.starts_with("#!/usr/bin/env node") || head.contains("node"))
-            .unwrap_or(false);
+    let is_shim = program.is_file() && is_node_shim(&program);
     let node_bin = if is_shim { resolve_node_bin() } else { None };
+    if is_shim && node_bin.is_none() {
+        anyhow::bail!(
+            "cannot resolve a node interpreter for the npm shim ({}); \
+             ensure node is on PATH and re-run `rtinferd install`, or run `rtinferd serve` directly",
+            program.display()
+        );
+    }
+
+    let uid = unsafe { libc_getuid() };
+    let target = format!("gui/{uid}");
+    let domain = format!("{target}/{LABEL}");
+
+    // 1) Bootout any launchd-managed instance first so KeepAlive cannot respawn
+    //    it while we drain the port.
+    let _ = Command::new("launchctl")
+        .args(["bootout", &domain])
+        .status();
+
+    // 2) Drain any remaining holder of the port: the pid recorded in the
+    //    endpoint file (covers a bare `rtinferd serve`) and any lsof listener.
+    if let Some(pid) = crate::endpoint_file::read_pid() {
+        drain_pid(pid);
+    }
+    for pid in pids_on_port(port) {
+        drain_pid(pid);
+    }
+
+    // 3) Confirm the port is actually free before bootstrapping (replaces the
+    //    racy fixed sleep that caused "bootstrap failed: 5: Input/output error").
+    if !wait_port_free(port) {
+        anyhow::bail!("port {port} is still in use after draining; refusing to bootstrap");
+    }
 
     if let Some(parent) = plist.parent() {
         std::fs::create_dir_all(parent)
@@ -234,32 +411,23 @@ pub fn run_install(port: u16) -> Result<()> {
     )
     .with_context(|| format!("cannot write plist {}", plist.display()))?;
 
-    let uid = unsafe { libc_getuid() };
-    let target = format!("gui/{uid}");
-    let domain = format!("{target}/{LABEL}");
-
-    // Deduplicate: bootout any prior instance. launchctl bootout is idempotent
-    // (returns non-zero if the domain is not loaded), so ignore the exit code.
-    // Wait a moment after bootout so the old process fully exits and frees the
-    // port before we bootstrap the replacement.
-    let _ = Command::new("launchctl")
-        .args(["bootout", &domain])
-        .status();
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    // Bootstrap the (possibly updated) plist. If bootstrap reports the domain
-    // already exists (rare race), kickstart the existing entry instead.
+    // 4) Bootstrap exactly one entry. On the residual "already loaded" race
+    //    (EIO / exit 5), bootout once more and retry a single time.
     let bootstrap = Command::new("launchctl")
         .args(["bootstrap", &target, &plist.display().to_string()])
         .status();
-    match bootstrap {
-        Ok(s) if s.success() => {}
-        _ => {
-            // Already loaded (or bootstrap failed): kickstart to pick up the
-            // new plist contents. -k kills any running instance first.
-            let _ = Command::new("launchctl")
-                .args(["kickstart", "-k", &domain])
-                .status();
+    if !matches!(bootstrap, Ok(s) if s.success()) {
+        let _ = Command::new("launchctl")
+            .args(["bootout", &domain])
+            .status();
+        let _ = wait_port_free(port);
+        let retry = Command::new("launchctl")
+            .args(["bootstrap", &target, &plist.display().to_string()])
+            .status();
+        if !matches!(retry, Ok(s) if s.success()) {
+            anyhow::bail!(
+                "launchctl bootstrap failed for {domain}; check ~/Library/Logs/rtinferd.err"
+            );
         }
     }
     eprintln!("rtinferd installed: {} (port {port})", plist.display());
@@ -360,5 +528,27 @@ mod tests {
             Some(v) => unsafe { std::env::set_var(LAUNCH_BIN_ENV, v) },
             None => unsafe { std::env::remove_var(LAUNCH_BIN_ENV) },
         }
+    }
+
+    #[test]
+    fn detects_node_shim_by_shebang_and_extension() {
+        let dir = std::env::temp_dir();
+        let shim = dir.join("rtinferd-shim-test.shim");
+        std::fs::write(&shim, "#!/usr/bin/env node\n'use strict';\n").unwrap();
+        assert!(is_node_shim(&shim), "shebang shim detected");
+        std::fs::remove_file(&shim).ok();
+
+        let js = dir.join("rtinferd-shim-test.js");
+        std::fs::write(&js, "console.log('x')\n").unwrap();
+        assert!(is_node_shim(&js), ".js extension detected");
+        std::fs::remove_file(&js).ok();
+
+        let native = dir.join("rtinferd-native-test");
+        std::fs::write(&native, b"\x7fELF native binary node\n").unwrap();
+        assert!(
+            !is_node_shim(&native),
+            "native binary mentioning node is not a shim"
+        );
+        std::fs::remove_file(&native).ok();
     }
 }

@@ -1,0 +1,62 @@
+name: auto-tag
+
+# Fully automatic release trigger: when a version bump lands on main (via
+# scripts/set-version.sh + a normal commit), this verifies the workspace and
+# pushes the matching `vX.Y.Z` tag. The tag push then fires release.yml
+# (build matrix -> npm publish). No manual tag step is required.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rtinfer-auto-tag
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        name: Resolve workspace version
+        run: |
+          set -euo pipefail
+          # Fail fast if any manifest drifts from Cargo.toml.
+          bash scripts/set-version.sh --check
+          version="$(awk '/^\[workspace\.package\]/{f=1} f&&/^version *= *"/{gsub(/^version *= *"|".*$/,"");print;exit}' Cargo.toml)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Skip if tag exists
+        id: gate
+        run: |
+          set -euo pipefail
+          tag="v${{ steps.v.outputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "$tag already exists; nothing to release"
+          else
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.gate.outputs.exists == '0'
+        with:
+          components: clippy, rustfmt
+      - name: Verify workspace
+        if: steps.gate.outputs.exists == '0'
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+      - name: Create and push tag
+        if: steps.gate.outputs.exists == '0'
+        run: |
+          set -euo pipefail
+          tag="v${{ steps.v.outputs.version }}"
+          git tag "$tag"
+          git push origin "$tag"

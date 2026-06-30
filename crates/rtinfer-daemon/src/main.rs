@@ -2,6 +2,7 @@
 
 mod endpoint_file;
 mod install;
+mod lock;
 mod self_update;
 mod server;
 
@@ -9,7 +10,9 @@ use clap::{Parser, Subcommand};
 
 /// Default loopback port. rtinfer owns its own port (cse-toold cockpit keeps
 /// 8787); clients discover the live port through `~/.cse-rtinfer/endpoint.json`.
-const DEFAULT_PORT: u16 = 8765;
+/// Debug builds shift to 8766 so `cargo run -- serve` never collides with the
+/// release LaunchAgent on 8765.
+const DEFAULT_PORT: u16 = if cfg!(debug_assertions) { 8766 } else { 8765 };
 
 #[derive(Parser)]
 #[command(

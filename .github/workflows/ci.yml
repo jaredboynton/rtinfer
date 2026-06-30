@@ -9,6 +9,13 @@ permissions:
   contents: read
 
 jobs:
+  versions:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version coupling
+        run: bash scripts/set-version.sh --check
+
   rust:
     runs-on: ubuntu-22.04
     steps:

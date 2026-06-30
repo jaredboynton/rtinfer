@@ -53,6 +53,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Inject release version
+        run: bash scripts/set-version.sh "${{ needs.resolve-version.outputs.version }}"
       - name: Build rtinferd (release)
         run: cargo build --release -p rtinfer-daemon --target ${{ matrix.target }}
       - name: Stage binary
@@ -68,7 +70,6 @@ jobs:
   publish:
     needs: [resolve-version, build]
     runs-on: ubuntu-22.04
-    environment: npm-publish
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -83,6 +84,9 @@ jobs:
           VERSION: ${{ needs.resolve-version.outputs.version }}
         run: |
           set -euo pipefail
+          # Stamp the tag version into every manifest so npm publishes match
+          # the version baked into the built binary (keeps self-update stable).
+          bash scripts/set-version.sh "$VERSION"
           for platform in darwin-arm64 linux-arm64; do
             mkdir -p "packages/$platform/bin"
             cp "dl/rtinferd-$platform/rtinferd" "packages/$platform/bin/rtinferd"

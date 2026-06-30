@@ -30,7 +30,11 @@ function npmGlobalShim() {
 
 try {
   const shim = npmGlobalShim();
-  const env = shim ? { ...process.env, RTINFER_LAUNCH_BIN: shim } : process.env;
+  // Hand the native installer the exact node this postinstall runs under
+  // (process.execPath). launchd does not inherit the shell PATH (fnm/nvm
+  // shims), so the installer bakes this absolute node into the plist.
+  const env = { ...process.env, RTINFER_LAUNCH_NODE: process.execPath };
+  if (shim) env.RTINFER_LAUNCH_BIN = shim;
   const result = spawnRaw(['install'], { env });
   if (result.error || (result.status != null && result.status !== 0)) {
     console.error('[rtinfer] postinstall: daemon not installed automatically; run `rtinferd install` to enable the always-on service.');

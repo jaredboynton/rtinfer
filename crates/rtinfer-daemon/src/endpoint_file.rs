@@ -24,8 +24,26 @@ pub fn dir() -> Option<PathBuf> {
 }
 
 /// Full path to the well-known file: `~/.cse-rtinfer/endpoint.json`.
+///
+/// Debug builds advertise at `endpoint-dev.json` instead so a local
+/// `cargo run -- serve` (port 8766) never shadows the release daemon's
+/// authoritative `endpoint.json`.
 pub fn path() -> Option<PathBuf> {
-    dir().map(|d| d.join("endpoint.json"))
+    let name = if cfg!(debug_assertions) {
+        "endpoint-dev.json"
+    } else {
+        "endpoint.json"
+    };
+    dir().map(|d| d.join(name))
+}
+
+/// Read the advertised daemon PID from the (release) endpoint file, if present.
+/// Used by `install` to detect and drain a running instance.
+pub fn read_pid() -> Option<u32> {
+    let p = dir().map(|d| d.join("endpoint.json"))?;
+    let body = std::fs::read_to_string(p).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    v.get("pid")?.as_u64().map(|n| n as u32)
 }
 
 /// Write the endpoint advertisement atomically (tmp + rename, 0600).
@@ -136,7 +154,10 @@ mod tests {
     #[test]
     fn path_ends_with_well_known() {
         if let Some(p) = path() {
-            assert!(p.ends_with(".cse-rtinfer/endpoint.json"));
+            assert!(
+                p.ends_with(".cse-rtinfer/endpoint.json")
+                    || p.ends_with(".cse-rtinfer/endpoint-dev.json")
+            );
         }
     }
 }

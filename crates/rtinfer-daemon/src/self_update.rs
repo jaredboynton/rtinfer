@@ -24,6 +24,7 @@
 use std::process::Stdio;
 use std::time::Duration;
 
+use serde_json::json;
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::interval;
@@ -41,19 +42,63 @@ pub fn current_version() -> &'static str {
 /// within seconds, and frequent `npm view` calls are wasteful.
 pub const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
+/// Cap on the consecutive-failure backoff multiplier (8 * 30min = 4h).
+const MAX_BACKOFF_TICKS: u32 = 8;
+
+/// Persisted self-update state: remembers the last version we tried to install
+/// and the consecutive failure count so a broken release cannot drive an
+/// infinite `npm i -g` loop. Best-effort: read/write failures degrade to the
+/// current (stateless) behavior.
+fn state_path() -> Option<std::path::PathBuf> {
+    crate::endpoint_file::dir().map(|d| d.join("self-update.json"))
+}
+
+fn read_last_attempt() -> Option<String> {
+    let p = state_path()?;
+    let body = std::fs::read_to_string(p).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    v.get("last_attempted")?.as_str().map(|s| s.to_string())
+}
+
+fn write_last_attempt(version: &str) {
+    if let Some(p) = state_path() {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            &p,
+            serde_json::to_vec_pretty(&json!({ "last_attempted": version })).unwrap_or_default(),
+        );
+    }
+}
+
 /// Spawn the background self-update poller. On a confirmed newer published
 /// version that installs cleanly, it flips `shutdown` so `serve` drains and
 /// exits; launchd then respawns the updated shim. Returns immediately.
+///
+/// Disabled entirely for debug builds and when `RTINFER_SKIP_SELF_UPDATE=1`:
+/// a `cargo run -- serve` must never run `npm i -g` against the global install.
 pub fn spawn(shutdown: watch::Sender<bool>, check_interval: Duration) {
+    if cfg!(debug_assertions) || std::env::var_os("RTINFER_SKIP_SELF_UPDATE").is_some() {
+        info!("rtinfer: self-update disabled (debug build or RTINFER_SKIP_SELF_UPDATE)");
+        return;
+    }
     tokio::spawn(async move {
         let mut tick = interval(check_interval);
         // The first tick fires immediately; skip it so we do not check before
         // the daemon has even finished booting.
         tick.tick().await;
+        // Number of extra ticks to skip after a failure (exponential backoff).
+        let mut skip_ticks: u32 = 0;
+        let mut failures: u32 = 0;
         loop {
             tick.tick().await;
             if *shutdown.borrow() {
                 return;
+            }
+            if skip_ticks > 0 {
+                skip_ticks -= 1;
+                continue;
             }
             match check_and_update().await {
                 Ok(true) => {
@@ -61,22 +106,44 @@ pub fn spawn(shutdown: watch::Sender<bool>, check_interval: Duration) {
                     let _ = shutdown.send(true);
                     return;
                 }
-                Ok(false) => {}
-                Err(e) => warn!(error = %e, "rtinfer: self-update check skipped"),
+                Ok(false) => {
+                    failures = 0;
+                }
+                Err(e) => {
+                    failures = failures.saturating_add(1);
+                    skip_ticks = failures.min(MAX_BACKOFF_TICKS);
+                    warn!(error = %e, failures, "rtinfer: self-update check skipped; backing off");
+                }
             }
         }
     });
 }
 
-/// One check+update cycle. Returns `Ok(true)` only when a strictly-newer version
-/// was found AND `npm i -g` succeeded (so the caller should drain+exit).
+/// One check+update cycle. Returns `Ok(true)` only when a strictly-newer STABLE
+/// version was found AND `npm i -g` succeeded (so the caller should drain+exit).
 async fn check_and_update() -> Result<bool, String> {
     let latest = npm_latest_version().await?;
     let current = current_version();
+    // Never auto-adopt a prerelease (e.g. `0.2.0-rc1`); `latest` should already
+    // exclude them, but guard defensively.
+    if is_prerelease(&latest) {
+        return Ok(false);
+    }
     if !is_newer(&latest, current) {
         return Ok(false);
     }
+    // If we already tried this exact version and we are STILL on an older
+    // build, the prior `npm i -g` did not advance the running version (broken
+    // release / version decoupling). Skip rather than loop forever.
+    if read_last_attempt().as_deref() == Some(latest.as_str()) {
+        warn!(latest = %latest, current, "rtinfer: latest already attempted but version did not advance; skipping");
+        return Ok(false);
+    }
     info!(current, latest = %latest, "rtinfer: newer version published; installing");
+    write_last_attempt(&latest);
+
+    // Serialize against `rtinferd install` (postinstall) via the shared lock.
+    let _guard = crate::lock::try_acquire();
     npm_install_global().await?;
     Ok(true)
 }
@@ -104,9 +171,15 @@ async fn npm_latest_version() -> Result<String, String> {
 }
 
 /// `npm i -g <pkg>@latest`. Errors on non-zero exit.
+///
+/// Sets `RTINFER_SKIP_POSTINSTALL=1`: the new package's postinstall would
+/// otherwise run `rtinferd install` and re-bootstrap the LaunchAgent while we
+/// are draining for the respawn. launchd respawns the updated shim on exit, so
+/// no reinstall is needed here.
 async fn npm_install_global() -> Result<(), String> {
     let status = Command::new("npm")
         .args(["install", "-g", "--quiet", &format!("{PACKAGE}@latest")])
+        .env("RTINFER_SKIP_POSTINSTALL", "1")
         .stdin(Stdio::null())
         .status()
         .await
@@ -148,9 +221,14 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
     false
 }
 
+/// A version is a prerelease if it carries a `-` suffix (e.g. `0.2.0-rc1`).
+pub fn is_prerelease(v: &str) -> bool {
+    v.contains('-')
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_newer;
+    use super::{is_newer, is_prerelease};
 
     #[test]
     fn detects_strictly_newer_versions() {
@@ -172,5 +250,13 @@ mod tests {
         // Suffix segments degrade to their numeric prefix; never panics.
         assert!(!is_newer("0.1.0-rc1", "0.1.0"));
         assert!(is_newer("0.2.0-rc1", "0.1.0"));
+    }
+
+    #[test]
+    fn prerelease_is_detected() {
+        assert!(is_prerelease("0.2.0-rc1"));
+        assert!(is_prerelease("1.0.0-beta.2"));
+        assert!(!is_prerelease("0.1.3"));
+        assert!(!is_prerelease("10.20.30"));
     }
 }
