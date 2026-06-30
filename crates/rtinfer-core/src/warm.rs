@@ -32,8 +32,9 @@
 //! `provider_error` envelope so the client falls open.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -47,6 +48,36 @@ use crate::{protocol, CodexAuth, RealtimeError, RealtimeTool, REALTIME_URL};
 /// Reconnect a warm session open at least this long, before the server-side
 /// 60-minute Realtime cap forces a mid-ask close. Checked lazily at ask start.
 const SESSION_MAX_AGE: Duration = Duration::from_secs(50 * 60);
+
+/// Sticky-routing overflow threshold. When a family's pinned session has at
+/// least this many in-flight asks, the next same-family ask overflows to the
+/// least-loaded session WITHOUT re-pinning, so a parallel burst spreads across
+/// the pool while the pinned session remains the cache home for the next serial
+/// call. Default 1: a single in-flight ask overflows (maximises parallelism).
+fn sticky_overflow_inflight() -> usize {
+    std::env::var("UNIFABLE_STICKY_OVERFLOW_INFLIGHT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1)
+}
+
+/// Kill-switch for family-sticky routing. Default ON. When OFF, `pick` ignores
+/// the system-prompt family hash and falls back to idle/grow/least-loaded (the
+/// pre-sticky behavior). Mirrors the Python judge daemon's STICKY_ROUTING.
+/// Read once at pool construction so per-pool tests do not race on the global
+/// env (env vars are process-global and parallel tests would otherwise
+/// interfere).
+fn sticky_routing_enabled_at_build() -> bool {
+    !matches!(
+        std::env::var("UNIFABLE_STICKY_ROUTING")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
 
 /// Wall-clock ceiling for one out-of-band structured ask on a warm socket.
 const ASK_WALL_CLOCK: Duration = Duration::from_secs(180);
@@ -277,22 +308,57 @@ impl AuthLoader {
 }
 
 /// Process-shared pool of warm sessions, lazily grown per model up to `per_model`.
+///
+/// # Prompt-cache sticky routing
+///
+/// gpt-realtime caches every prefix it has seen on a given session. To maximise
+/// cache hits, `pick` hashes the system prompt to a "family" and pins each
+/// family to a specific session so repeated calls with the same instructions
+/// land on the same warm socket. When the pinned session is busy (>=
+/// `STICKY_OVERFLOW_INFLIGHT` in-flight), the next same-family ask overflows to
+/// the least-loaded session WITHOUT re-pinning, so a parallel burst spreads
+/// across the pool while the pinned session stays the cache home for the next
+/// serial call. A dead (dropped-socket) pinned session triggers a cold re-pin
+/// to the least-loaded live session. This mirrors the Python judge daemon's
+/// `_pick_worker` / `_family_to_worker` sticky routing.
 pub struct WarmSessionPool {
     base_endpoint: String,
     per_model: usize,
+    sticky: bool,
     auth: AuthLoader,
     sessions: Mutex<HashMap<String, Vec<Arc<WarmSession>>>>,
+    /// family_hash -> pinned session (Weak so a dropped session is GC-able and
+    /// the upgrade check doubles as the "still alive" readiness gate).
+    family_pins: Mutex<HashMap<(String, u64), Weak<WarmSession>>>,
 }
 
 impl WarmSessionPool {
     /// New pool keeping up to `per_model` warm sockets per distinct model. When
-    /// `auth_source` is `None`, sessions load `~/.codex/auth.json`.
+    /// `auth_source` is `None`, sessions load `~/.codex/auth.json`. Sticky
+    /// routing (system-prompt -> pinned session) is ON by default; disable via
+    /// `UNIFABLE_STICKY_ROUTING=0` in the environment at construction time.
     pub fn new(per_model: usize, auth_source: Option<SharedCodexAuthSource>) -> Arc<Self> {
         Arc::new(Self {
             base_endpoint: REALTIME_URL.to_owned(),
             per_model: per_model.max(1),
+            sticky: sticky_routing_enabled_at_build(),
             auth: AuthLoader::new(auth_source),
             sessions: Mutex::new(HashMap::new()),
+            family_pins: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Test-only constructor with explicit sticky-routing control so parallel
+    /// tests do not race on the global env var.
+    #[cfg(test)]
+    fn new_with_sticky(per_model: usize, sticky: bool) -> Arc<Self> {
+        Arc::new(Self {
+            base_endpoint: REALTIME_URL.to_owned(),
+            per_model: per_model.max(1),
+            sticky,
+            auth: AuthLoader::new(None),
+            sessions: Mutex::new(HashMap::new()),
+            family_pins: Mutex::new(HashMap::new()),
         })
     }
 
@@ -306,7 +372,7 @@ impl WarmSessionPool {
         model: Option<&str>,
         reasoning_effort: Option<&str>,
     ) -> Result<Value, RealtimeError> {
-        let session = self.pick(model).await;
+        let session = self.pick(model, system).await;
         session.load.fetch_add(1, Ordering::Relaxed);
         let out = session
             .ask_structured(
@@ -322,44 +388,97 @@ impl WarmSessionPool {
         out
     }
 
-    /// Pick a session for `model`. Selection strategy:
-    ///   1. If any existing socket is idle (load 0), reuse it - this keeps
-    ///      sequential callers pinned to ONE warm connection (no fresh
-    ///      handshake, maximal prompt-cache stickiness).
-    ///   2. Otherwise, if the ring is below `per_model`, open a new socket so
-    ///      concurrent asks get real parallelism.
-    ///   3. Otherwise, route to the least-loaded existing socket.
+    /// Pick a session for `model` + `system` (the system prompt seeds the
+    /// sticky-routing family hash). Selection strategy:
     ///
-    /// A warm (already-connected) socket wins ties so we never resurrect a
-    /// cold socket while a warm one sits idle.
-    async fn pick(&self, model: Option<&str>) -> Arc<WarmSession> {
+    /// When sticky routing is ON (default):
+    ///   1. Look up the family's pinned session. If it is alive (upgradeable
+    ///      Weak) and its load is below `STICKY_OVERFLOW_INFLIGHT`, return it ->
+    ///      same socket -> prompt-cache hit on the instructions+tools prefix.
+    ///   2. If the pinned session is alive but busy (>= overflow), return the
+    ///      least-loaded session WITHOUT re-pinning, so a same-family parallel
+    ///      burst spreads across the pool and the pinned session stays the
+    ///      cache home for the next serial call.
+    ///   3. Cold start or dead (dropped) pinned session: pick the least-loaded
+    ///      session (growing the ring if under capacity) and PIN it as the new
+    ///      cache home for this family.
+    ///
+    /// When sticky routing is OFF: fall back to idle/grow/least-loaded (the
+    /// pre-sticky behavior), ignoring the family hash.
+    async fn pick(&self, model: Option<&str>, system: &str) -> Arc<WarmSession> {
         let endpoint = protocol::endpoint_for_model(&self.base_endpoint, model);
         let key = model.unwrap_or("default").to_string();
-        let mut map = self.sessions.lock().await;
-        let ring = map.entry(key).or_default();
+        let family = family_hash(system);
 
-        // (1) An idle socket: prefer one that is already warm.
-        let idle = ring
-            .iter()
-            .filter(|s| s.load() == 0)
-            .min_by_key(|s| u8::from(!s.is_warm()));
-        if let Some(s) = idle {
-            return s.clone();
+        // (Sticky) Check the family pin BEFORE taking the sessions lock so a
+        // hot cache hit does not serialize behind ring growth. The Weak upgrade
+        // is the readiness gate: a dropped session fails to upgrade and falls
+        // through to the cold path.
+        if self.sticky {
+            let pin_key = (key.clone(), family);
+            let sticky = {
+                let pins = self.family_pins.lock().await;
+                pins.get(&pin_key).and_then(Weak::upgrade)
+            };
+            if let Some(s) = sticky {
+                if s.load() < sticky_overflow_inflight() {
+                    return s; // cache hit: same family -> same session
+                }
+                // Overflow: least-loaded WITHOUT re-pin. The pinned session
+                // stays the cache home for the next serial call.
+                return self.select_cold(&endpoint, &key).await;
+            }
+            // Cold or dead-sticky: select least-loaded and pin it.
+            let chosen = self.select_cold(&endpoint, &key).await;
+            self.family_pins
+                .lock()
+                .await
+                .insert(pin_key, Arc::downgrade(&chosen));
+            return chosen;
         }
 
+        // Sticky off: plain idle/grow/least-loaded, no pinning.
+        self.select_cold(&endpoint, &key).await
+    }
+
+    /// Least-loaded selection with lazy ring growth:
+    ///   1. An idle socket (load 0): prefer one that is already warm.
+    ///   2. Otherwise, if the ring is below `per_model`, open a new socket.
+    ///   3. Otherwise, route to the least-loaded existing socket (warm wins
+    ///      ties).
+    async fn select_cold(&self, endpoint: &str, key: &str) -> Arc<WarmSession> {
+        let mut map = self.sessions.lock().await;
+        let ring = map.entry(key.to_string()).or_default();
+
+        // (1) An idle socket: prefer one that is already warm (live connection).
+        if let Some(s) = ring
+            .iter()
+            .filter(|s| s.load() == 0)
+            .min_by_key(|s| u8::from(!s.is_warm()))
+        {
+            return s.clone();
+        }
         // (2) Grow the ring under concurrency.
         if ring.len() < self.per_model {
-            let s = Arc::new(WarmSession::new(endpoint));
+            let s = Arc::new(WarmSession::new(endpoint.to_string()));
             ring.push(s.clone());
             return s;
         }
-
-        // (3) Least-loaded existing socket.
+        // (3) Least-loaded existing socket; warm wins ties.
         ring.iter()
-            .min_by_key(|s| s.load())
+            .min_by_key(|s| (s.load(), u8::from(!s.is_warm())))
             .expect("ring is non-empty once per_model >= 1")
             .clone()
     }
+}
+
+/// Stable per-process family hash of a system prompt. The Realtime model caches
+/// every prefix it has seen on a session, so two calls with the same
+/// instructions share a cache home when routed to the same session.
+fn family_hash(system: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    system.hash(&mut h);
+    h.finish()
 }
 
 #[cfg(test)]
@@ -400,8 +519,8 @@ mod tests {
         let pool = WarmSessionPool::new(4, None);
         // Sequential picks (each released before the next) must return the SAME
         // socket: an idle one is reused rather than opening a cold connection.
-        let a = pool.pick(Some("gpt-realtime-2")).await;
-        let b = pool.pick(Some("gpt-realtime-2")).await;
+        let a = pool.pick(Some("gpt-realtime-2"), "SYS").await;
+        let b = pool.pick(Some("gpt-realtime-2"), "SYS").await;
         assert!(
             Arc::ptr_eq(&a, &b),
             "idle socket must be reused, not multiplied"
@@ -412,14 +531,17 @@ mod tests {
     async fn pick_grows_ring_only_under_concurrency() {
         let pool = WarmSessionPool::new(2, None);
         // Simulate an in-flight ask pinning the first socket.
-        let a = pool.pick(Some("gpt-realtime-2")).await;
+        let a = pool.pick(Some("gpt-realtime-2"), "SYS").await;
         a.load.fetch_add(1, Ordering::Relaxed);
-        // No idle socket -> grow the ring.
-        let b = pool.pick(Some("gpt-realtime-2")).await;
-        assert!(!Arc::ptr_eq(&a, &b), "busy socket forces a new one");
+        // Same family + sticky busy -> overflow grows the ring (no re-pin).
+        let b = pool.pick(Some("gpt-realtime-2"), "SYS").await;
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "busy sticky forces an overflow socket"
+        );
         b.load.fetch_add(1, Ordering::Relaxed);
         // Ring full and both busy -> route to least-loaded (here, a tie on a).
-        let c = pool.pick(Some("gpt-realtime-2")).await;
+        let c = pool.pick(Some("gpt-realtime-2"), "SYS").await;
         assert!(
             Arc::ptr_eq(&a, &c) || Arc::ptr_eq(&b, &c),
             "full busy ring routes to an existing least-loaded socket"
@@ -429,11 +551,132 @@ mod tests {
     #[tokio::test]
     async fn pick_keys_sessions_per_model() {
         let pool = WarmSessionPool::new(1, None);
-        let mini = pool.pick(Some("gpt-realtime-mini")).await;
-        let full = pool.pick(Some("gpt-realtime-2")).await;
+        let mini = pool.pick(Some("gpt-realtime-mini"), "SYS").await;
+        let full = pool.pick(Some("gpt-realtime-2"), "SYS").await;
         // Different models get independent rings (and endpoints).
         assert!(!Arc::ptr_eq(&mini, &full));
         assert!(mini.endpoint.contains("gpt-realtime-mini"));
         assert!(full.endpoint.contains("gpt-realtime-2"));
+    }
+
+    #[tokio::test]
+    async fn pick_sticks_same_family_to_one_session() {
+        // The core sticky property: two sequential asks with the SAME system
+        // prompt land on the SAME session (cache home). Distinct cold families
+        // may share an idle session (the machine caches every prefix it has
+        // seen), but once a family is pinned it sticks to that session even
+        // after other activity grows the ring.
+        let pool = WarmSessionPool::new(3, None);
+        let fa = pool.pick(Some("gpt-realtime-2"), "GRADE").await;
+        // Grow the ring by holding fa busy so a different family cold-pins to a
+        // new session, then release fa.
+        fa.load.fetch_add(1, Ordering::Relaxed);
+        let fb = pool.pick(Some("gpt-realtime-2"), "GROUNDED").await;
+        assert!(
+            !Arc::ptr_eq(&fa, &fb),
+            "distinct families under load get distinct sessions"
+        );
+        fa.load.fetch_sub(1, Ordering::Relaxed);
+        // The first family sticks to its original pinned session (cache hit).
+        let fa2 = pool.pick(Some("gpt-realtime-2"), "GRADE").await;
+        assert!(
+            Arc::ptr_eq(&fa, &fa2),
+            "same family must stick to its pinned cache home"
+        );
+        // The second family sticks to its own pinned session, not fa's.
+        let fb2 = pool.pick(Some("gpt-realtime-2"), "GROUNDED").await;
+        assert!(
+            Arc::ptr_eq(&fb, &fb2),
+            "second family sticks to its own cache home"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_overflow_does_not_repin() {
+        // When the sticky session is busy (>= STICKY_OVERFLOW_INFLIGHT), the
+        // next same-family ask overflows to another session WITHOUT re-pinning:
+        // after the sticky session drains, the next serial call sticks back.
+        let pool = WarmSessionPool::new(3, None);
+        let fa = pool.pick(Some("gpt-realtime-2"), "ARM").await;
+        fa.load.fetch_add(1, Ordering::Relaxed); // simulate in-flight
+                                                 // Overflow: same family, but sticky is busy -> a different session.
+        let over = pool.pick(Some("gpt-realtime-2"), "ARM").await;
+        assert!(
+            !Arc::ptr_eq(&fa, &over),
+            "busy sticky overflows to another session"
+        );
+        // Drain the sticky session.
+        fa.load.fetch_sub(1, Ordering::Relaxed);
+        // Next serial same-family call sticks back to the original cache home.
+        let fa2 = pool.pick(Some("gpt-realtime-2"), "ARM").await;
+        assert!(
+            Arc::ptr_eq(&fa, &fa2),
+            "overflow must not re-pin; sticky home survives a burst"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_dead_sticky_repins_cold() {
+        // A dropped (dead) pinned session fails the Weak upgrade and falls
+        // through to the cold path, which re-pins to a live session.
+        let pool = WarmSessionPool::new(3, None);
+        let fa = pool.pick(Some("gpt-realtime-2"), "ZONE").await;
+        // Drop the strong ref in the ring by simulating a dead pin: replace the
+        // family pin with a Weak to a session no longer in the ring.
+        let orphan = Arc::new(WarmSession::new("wss://orphan".to_string()));
+        let pin_key = ("gpt-realtime-2".to_string(), family_hash("ZONE"));
+        pool.family_pins
+            .lock()
+            .await
+            .insert(pin_key, Arc::downgrade(&orphan));
+        drop(orphan);
+        // Cold re-pin: the next ZONE call must NOT return the orphan (it cannot
+        // upgrade) and must pin a live ring session instead.
+        let fa2 = pool.pick(Some("gpt-realtime-2"), "ZONE").await;
+        assert!(
+            !Arc::ptr_eq(&fa, &fa2) || ring_has(&pool, "gpt-realtime-2", &fa2).await,
+            "dead sticky repins to a live ring session"
+        );
+        // The new pin is live: a follow-up sticks to it.
+        let fa3 = pool.pick(Some("gpt-realtime-2"), "ZONE").await;
+        assert!(
+            Arc::ptr_eq(&fa2, &fa3),
+            "repinned session is the new sticky cache home"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_sticky_off_falls_back_to_least_loaded() {
+        // With sticky routing disabled at construction, family pinning is off:
+        // two families share sessions by idle/least-loaded, and no pins are
+        // recorded. Uses the per-pool constructor so parallel tests do not race
+        // on the global env var.
+        let pool = WarmSessionPool::new_with_sticky(2, false);
+        let a = pool.pick(Some("gpt-realtime-2"), "GRADE").await;
+        let b = pool.pick(Some("gpt-realtime-2"), "GROUNDED").await;
+        // With sticky off and both idle, both families land on the SAME idle
+        // session (the pre-sticky idle-reuse behavior).
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "sticky off reuses the idle socket regardless of family"
+        );
+        assert!(
+            pool.family_pins.lock().await.is_empty(),
+            "no pins recorded when sticky is off"
+        );
+    }
+
+    async fn ring_has(pool: &WarmSessionPool, model: &str, s: &Arc<WarmSession>) -> bool {
+        let map = pool.sessions.lock().await;
+        map.get(model)
+            .map(|ring| ring.iter().any(|r| Arc::ptr_eq(r, s)))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn family_hash_is_deterministic_and_distinct() {
+        assert_eq!(family_hash("GRADE"), family_hash("GRADE"));
+        assert_ne!(family_hash("GRADE"), family_hash("GROUNDED"));
+        assert_ne!(family_hash(""), family_hash("GRADE"));
     }
 }
