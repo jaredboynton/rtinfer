@@ -47,10 +47,9 @@ fn dirs_home() -> Option<PathBuf> {
 /// no-op for the plist.
 fn npm_global_shim() -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os(LAUNCH_BIN_ENV) {
-        let p = PathBuf::from(explicit);
-        if p.exists() {
-            return Some(p);
-        }
+        // Trust the postinstall-provided path even if npm has not created the
+        // global bin shim yet; launchd should pin the stable future path.
+        return Some(PathBuf::from(explicit));
     }
     let out = Command::new("npm").args(["prefix", "-g"]).output().ok()?;
     if !out.status.success() {
@@ -204,14 +203,15 @@ mod tests {
 
     #[test]
     fn launch_program_prefers_explicit_shim_env() {
-        // A real, existing path so the existence check passes; the daemon's own
-        // binary is guaranteed present during the test run.
-        let me = std::env::current_exe().unwrap();
+        let shim = PathBuf::from("/tmp/rtinferd-stable-shim-for-test");
         let prev = std::env::var_os(LAUNCH_BIN_ENV);
         // SAFETY: single-threaded test; restored below.
-        unsafe { std::env::set_var(LAUNCH_BIN_ENV, &me) };
+        unsafe { std::env::set_var(LAUNCH_BIN_ENV, &shim) };
         let got = resolve_launch_program().unwrap();
-        assert_eq!(got, me, "explicit shim env must win over npm discovery");
+        assert_eq!(
+            got, shim,
+            "explicit shim env must win over npm discovery, even before npm creates it"
+        );
         match prev {
             Some(v) => unsafe { std::env::set_var(LAUNCH_BIN_ENV, v) },
             None => unsafe { std::env::remove_var(LAUNCH_BIN_ENV) },
