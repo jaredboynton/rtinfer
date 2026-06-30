@@ -2,6 +2,7 @@
 
 mod endpoint_file;
 mod install;
+mod self_update;
 mod server;
 
 use clap::{Parser, Subcommand};

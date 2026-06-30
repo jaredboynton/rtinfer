@@ -21,7 +21,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rtinfer_core::{CodexResponsesPool, RealtimePool};
+use rtinfer_core::{CodexResponsesPool, WarmSessionPool};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::info;
@@ -29,9 +29,16 @@ use tracing::info;
 /// Wire-contract identifier shared with every rtinfer client.
 pub const RTINFER_CONTRACT: &str = "rtinfer/1";
 
-/// Shared daemon state: the two warm pools.
+/// Warm Realtime sockets kept per model. The realtime fan-out (navigators +
+/// scorer) issues a handful of concurrent asks; 4 independent warm sessions per
+/// model give real parallelism without cid-multiplexing one socket.
+const WARM_SESSIONS_PER_MODEL: usize = 4;
+
+/// Shared daemon state: the warm realtime sessions + the responses pool.
 pub struct AppState {
-    pub realtime_pool: Arc<RealtimePool>,
+    /// Warm persistent Realtime sockets (out-of-band asks, no per-call
+    /// handshake). The realtime_structured tier dispatches here.
+    pub warm_realtime: Arc<WarmSessionPool>,
     pub codex_responses_pool: Arc<CodexResponsesPool>,
 }
 
@@ -39,7 +46,7 @@ impl AppState {
     /// Build the default file-auth pools (both read `~/.codex/auth.json`).
     pub fn new_file_auth() -> Arc<Self> {
         Arc::new(Self {
-            realtime_pool: RealtimePool::new(),
+            warm_realtime: WarmSessionPool::new(WARM_SESSIONS_PER_MODEL, None),
             codex_responses_pool: CodexResponsesPool::builder().build(),
         })
     }
@@ -54,8 +61,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Bind `127.0.0.1:{port}`, write the well-known endpoint file, and serve
-/// until the process is killed.
+/// Bind `127.0.0.1:{port}`, write the well-known endpoint file, and serve until
+/// the process is killed or a newer npm release is self-installed (drain+exit so
+/// launchd respawns the updated shim).
 pub async fn serve(port: u16) -> anyhow::Result<()> {
     let state = AppState::new_file_auth();
     let app = router(state);
@@ -64,8 +72,22 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
     let bound = listener.local_addr()?;
     let base_url = format!("http://127.0.0.1:{}", bound.port());
     crate::endpoint_file::write(&base_url)?;
-    info!(%base_url, "rtinfer: serving");
-    axum::serve(listener, app).await?;
+    info!(%base_url, version = crate::self_update::current_version(), "rtinfer: serving");
+
+    // Background self-update: drains the server on a confirmed newer release.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    crate::self_update::spawn(shutdown_tx, crate::self_update::DEFAULT_CHECK_INTERVAL);
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            // Drain on either a self-update signal or SIGINT/SIGTERM.
+            let ctrl_c = tokio::signal::ctrl_c();
+            tokio::select! {
+                _ = ctrl_c => {}
+                _ = shutdown_rx.changed() => {}
+            }
+        })
+        .await?;
     Ok(())
 }
 
@@ -85,7 +107,6 @@ struct RtInferRequest {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     reasoning_effort: Option<String>,
 }
 
@@ -159,13 +180,14 @@ async fn rtinfer(State(state): State<Arc<AppState>>, Json(req): Json<RtInferRequ
                 );
             };
             match state
-                .realtime_pool
-                .ask_structured_with_model(
+                .warm_realtime
+                .ask_structured(
                     &req.system,
                     &req.user,
                     name,
                     schema,
                     req.model.as_deref(),
+                    req.reasoning_effort.as_deref(),
                 )
                 .await
             {

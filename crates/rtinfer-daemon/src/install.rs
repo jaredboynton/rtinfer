@@ -1,12 +1,19 @@
 //! LaunchAgent install / uninstall for the rtinfer daemon (macOS).
 //!
-//! Pins a per-user `KeepAlive` LaunchAgent to the current binary running
-//! `rtinferd serve --port <port>`. launchd respawns it on crash and starts it
-//! at login, so the daemon is always-on without an external supervisor.
+//! Pins a per-user `KeepAlive` LaunchAgent to the STABLE npm global bin shim
+//! (`$(npm prefix -g)/bin/rtinferd`) running `serve --port <port>`. npm rewrites
+//! that shim in place on every `npm i -g`, so the daemon's self-update can drain
+//! + exit and launchd respawns the updated binary WITHOUT rewriting the plist.
+//! launchd respawns on crash and starts it at login, so the daemon is always-on
+//! without an external supervisor.
+//!
+//! When the stable shim cannot be resolved (manual `rtinferd serve`, dev builds,
+//! `npm` absent) the install falls back to the current executable path so a
+//! hand-run install still works; that path is simply not self-update-stable.
 //!
 //! Unlike cse-toold there is no keychain / TCC dependency here: the daemon
-//! only opens loopback sockets and reads `~/.codex/auth.json`, so a versioned
-//! binary path is fine and no codesign pinning is required.
+//! only opens loopback sockets and reads `~/.codex/auth.json`, so no codesign
+//! pinning is required.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,6 +22,10 @@ use anyhow::{Context, Result};
 
 /// launchd label for the rtinfer daemon.
 pub const LABEL: &str = "com.jaredboynton.rtinferd";
+
+/// Override the launched program path (set by the npm postinstall to the exact
+/// global bin shim). Takes precedence over npm-prefix discovery.
+const LAUNCH_BIN_ENV: &str = "RTINFER_LAUNCH_BIN";
 
 fn home() -> Result<PathBuf> {
     dirs_home().context("cannot resolve home directory")
@@ -29,6 +40,38 @@ fn dirs_home() -> Option<PathBuf> {
     {
         std::env::var_os("USERPROFILE").map(PathBuf::from)
     }
+}
+
+/// The stable npm global bin shim for `rtinferd`, if it can be located and
+/// exists. This is the path the LaunchAgent should pin so self-update is a
+/// no-op for the plist.
+fn npm_global_shim() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os(LAUNCH_BIN_ENV) {
+        let p = PathBuf::from(explicit);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let out = Command::new("npm").args(["prefix", "-g"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let prefix = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if prefix.is_empty() {
+        return None;
+    }
+    let shim = PathBuf::from(prefix).join("bin").join("rtinferd");
+    shim.exists().then_some(shim)
+}
+
+/// Resolve the program path the LaunchAgent runs: prefer the stable npm shim,
+/// fall back to the current executable (dev / manual installs).
+fn resolve_launch_program() -> Result<PathBuf> {
+    if let Some(shim) = npm_global_shim() {
+        return Ok(shim);
+    }
+    let program = std::env::current_exe().context("cannot resolve current executable path")?;
+    Ok(program.canonicalize().unwrap_or(program))
 }
 
 #[cfg(target_os = "macos")]
@@ -73,11 +116,11 @@ pub fn render_plist(program: &Path, home: &Path, port: u16) -> String {
     )
 }
 
-/// Install + load the LaunchAgent, pinned to the current binary.
+/// Install + load the LaunchAgent, pinned to the stable npm global shim (or the
+/// current binary as a dev/manual fallback).
 #[cfg(target_os = "macos")]
 pub fn run_install(port: u16) -> Result<()> {
-    let program = std::env::current_exe().context("cannot resolve current executable path")?;
-    let program = program.canonicalize().unwrap_or(program);
+    let program = resolve_launch_program()?;
     let home = home()?;
     let plist = plist_path()?;
     if let Some(parent) = plist.parent() {
@@ -157,5 +200,21 @@ mod tests {
         assert!(p.contains("<string>8765</string>"));
         assert!(p.contains("com.jaredboynton.rtinferd"));
         assert!(p.contains("<key>KeepAlive</key>"));
+    }
+
+    #[test]
+    fn launch_program_prefers_explicit_shim_env() {
+        // A real, existing path so the existence check passes; the daemon's own
+        // binary is guaranteed present during the test run.
+        let me = std::env::current_exe().unwrap();
+        let prev = std::env::var_os(LAUNCH_BIN_ENV);
+        // SAFETY: single-threaded test; restored below.
+        unsafe { std::env::set_var(LAUNCH_BIN_ENV, &me) };
+        let got = resolve_launch_program().unwrap();
+        assert_eq!(got, me, "explicit shim env must win over npm discovery");
+        match prev {
+            Some(v) => unsafe { std::env::set_var(LAUNCH_BIN_ENV, v) },
+            None => unsafe { std::env::remove_var(LAUNCH_BIN_ENV) },
+        }
     }
 }

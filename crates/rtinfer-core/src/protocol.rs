@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use http::Request;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
@@ -34,7 +34,7 @@ const STRUCTURED_WALL_CLOCK: Duration = Duration::from_secs(180);
 
 static RUSTLS_PROVIDER: std::sync::Once = std::sync::Once::new();
 
-type RealtimeWs =
+pub(crate) type RealtimeWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 enum FrameEvent {
@@ -363,7 +363,7 @@ pub async fn run_session_structured(
     })
 }
 
-async fn open_realtime_session(
+pub(crate) async fn open_realtime_session(
     auth: &CodexAuth,
     endpoint: &str,
     handshake_timeout: Option<Duration>,
@@ -489,8 +489,14 @@ fn loop_action(
     }
 }
 
-fn provider_error(env: InboundEnvelope) -> RealtimeError {
-    let pe = env.error.unwrap_or_else(|| crate::ProviderError {
+pub(crate) fn provider_error(env: InboundEnvelope) -> RealtimeError {
+    provider_error_from(env.error)
+}
+
+/// Build a provider error from an optional error payload (borrow-friendly so a
+/// warm read loop holding `&InboundEnvelope` can surface it without consuming).
+pub(crate) fn provider_error_from(err: Option<crate::ProviderError>) -> RealtimeError {
+    let pe = err.unwrap_or_else(|| crate::ProviderError {
         code: None,
         r#type: None,
         message: Some("(no detail)".into()),
@@ -501,7 +507,9 @@ fn provider_error(env: InboundEnvelope) -> RealtimeError {
     }
 }
 
-fn extract_tool_calls(env: &InboundEnvelope) -> Result<Vec<RealtimeToolCall>, RealtimeError> {
+pub(crate) fn extract_tool_calls(
+    env: &InboundEnvelope,
+) -> Result<Vec<RealtimeToolCall>, RealtimeError> {
     let mut items = Vec::new();
     if let Some(response) = &env.response {
         items.extend(response.output.clone());
@@ -532,7 +540,7 @@ fn extract_tool_calls(env: &InboundEnvelope) -> Result<Vec<RealtimeToolCall>, Re
     Ok(calls)
 }
 
-fn collect_done_text(env: &InboundEnvelope) -> String {
+pub(crate) fn collect_done_text(env: &InboundEnvelope) -> String {
     let mut items = Vec::new();
     if let Some(response) = &env.response {
         items.extend(response.output.clone());
@@ -563,11 +571,96 @@ fn collect_done_text(env: &InboundEnvelope) -> String {
     out
 }
 
-fn io_err(e: tokio_tungstenite::tungstenite::Error) -> RealtimeError {
+pub(crate) fn io_err(e: tokio_tungstenite::tungstenite::Error) -> RealtimeError {
     RealtimeError::Protocol(format!("ws send: {e}"))
 }
 
-fn install_rustls_provider() {
+/// Send a JSON value as a single WS text frame. Used by the warm-session layer
+/// to dispatch an out-of-band `response.create` on an already-open socket.
+pub(crate) async fn send_value(ws: &mut RealtimeWs, value: &Value) -> Result<(), RealtimeError> {
+    let text = serde_json::to_string(value)?;
+    ws.send(Message::text(text)).await.map_err(io_err)
+}
+
+/// Read+decode the next inbound envelope on a warm socket, answering pings and
+/// skipping unparseable/non-envelope frames. `Ok(None)` on a close frame.
+pub(crate) async fn next_envelope(
+    ws: &mut RealtimeWs,
+) -> Result<Option<InboundEnvelope>, RealtimeError> {
+    loop {
+        let Some(frame) = ws.next().await else {
+            return Ok(None);
+        };
+        match decode_frame(ws, frame).await? {
+            FrameEvent::Envelope(env) => return Ok(Some(env)),
+            FrameEvent::Continue => continue,
+            FrameEvent::Closed => return Ok(None),
+        }
+    }
+}
+
+/// Prime a freshly-opened warm socket with a bare `session.update` (text output,
+/// no tools): tools + instructions ride each out-of-band `response.create`, so
+/// the session itself stays generic and reusable across asks.
+pub(crate) async fn prime_session(ws: &mut RealtimeWs) -> Result<(), RealtimeError> {
+    let msg = json!({
+        "type": "session.update",
+        "session": { "type": "realtime", "output_modalities": ["text"] },
+    });
+    send_value(ws, &msg).await
+}
+
+/// Best-effort graceful close of a warm socket being retired.
+pub(crate) async fn graceful_close(ws: &mut RealtimeWs) -> Result<(), RealtimeError> {
+    ws.send(Message::Close(Some(CloseFrame {
+        code: CloseCode::Normal,
+        reason: "rotate".into(),
+    })))
+    .await
+    .map_err(io_err)
+}
+
+/// Outcome of folding one inbound envelope into an in-progress structured ask.
+pub(crate) enum AskOutcome {
+    /// Keep reading (delta or ignorable frame).
+    Pending,
+    /// The forced tool call's arguments (the structured result).
+    Object(Value),
+    /// `response.done` with no tool call: caller salvages accumulated text.
+    Done,
+}
+
+/// Fold one envelope into a warm structured ask: accumulate text deltas, return
+/// the tool-call arguments on `response.done`, or surface a provider error.
+pub(crate) fn warm_envelope_outcome(
+    env: &InboundEnvelope,
+    text_fallback: &mut String,
+) -> Result<AskOutcome, RealtimeError> {
+    match env.kind.as_str() {
+        "response.output_text.delta" => {
+            if let Some(d) = &env.delta {
+                text_fallback.push_str(d);
+            }
+            Ok(AskOutcome::Pending)
+        }
+        "response.done" | "response.completed" => {
+            let mut calls = extract_tool_calls(env)?;
+            if !calls.is_empty() {
+                Ok(AskOutcome::Object(calls.remove(0).arguments))
+            } else {
+                if text_fallback.is_empty() {
+                    text_fallback.push_str(&collect_done_text(env));
+                }
+                Ok(AskOutcome::Done)
+            }
+        }
+        "response.failed" => Err(provider_error_from(env.error.clone())),
+        "error" => Err(provider_error_from(env.error.clone())),
+        _ => Ok(AskOutcome::Pending),
+    }
+}
+
+pub(crate) fn install_rustls_provider() {
     RUSTLS_PROVIDER.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
@@ -661,6 +754,54 @@ pub(crate) const READ_DEADLINE: Duration = Duration::from_secs(120);
 #[cfg(test)]
 mod tests {
     use super::endpoint_for_model;
+    use super::{warm_envelope_outcome, AskOutcome};
+    use crate::InboundEnvelope;
+
+    fn env(json_str: &str) -> InboundEnvelope {
+        serde_json::from_str(json_str).expect("valid envelope")
+    }
+
+    #[test]
+    fn warm_outcome_accumulates_text_then_salvages_json_on_done() {
+        let mut buf = String::new();
+        let d = env(r#"{"type":"response.output_text.delta","delta":"{\"a\":"}"#);
+        assert!(matches!(
+            warm_envelope_outcome(&d, &mut buf).unwrap(),
+            AskOutcome::Pending
+        ));
+        let d2 = env(r#"{"type":"response.output_text.delta","delta":"1}"}"#);
+        assert!(matches!(
+            warm_envelope_outcome(&d2, &mut buf).unwrap(),
+            AskOutcome::Pending
+        ));
+        // done with no tool call -> caller salvages the accumulated JSON text.
+        let done = env(r#"{"type":"response.done","response":{"output":[]}}"#);
+        assert!(matches!(
+            warm_envelope_outcome(&done, &mut buf).unwrap(),
+            AskOutcome::Done
+        ));
+        assert_eq!(buf, "{\"a\":1}");
+    }
+
+    #[test]
+    fn warm_outcome_returns_tool_call_arguments() {
+        let mut buf = String::new();
+        let done = env(r#"{"type":"response.done","response":{"output":[
+                {"type":"function_call","name":"result","call_id":"c1","arguments":"{\"score\":9}"}
+            ]}}"#);
+        match warm_envelope_outcome(&done, &mut buf).unwrap() {
+            AskOutcome::Object(v) => assert_eq!(v["score"], 9),
+            _ => panic!("expected tool-call arguments"),
+        }
+    }
+
+    #[test]
+    fn warm_outcome_surfaces_provider_error() {
+        let mut buf = String::new();
+        let err = env(r#"{"type":"error","error":{"code":"rate_limit","message":"slow down"}}"#);
+        let out = warm_envelope_outcome(&err, &mut buf);
+        assert!(out.is_err(), "an error frame must surface as Err");
+    }
 
     #[test]
     fn endpoint_for_model_replaces_existing_param() {
