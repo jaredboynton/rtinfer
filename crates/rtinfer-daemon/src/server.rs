@@ -30,8 +30,14 @@ use tracing::info;
 /// Wire-contract identifier shared with every rtinfer client.
 pub const RTINFER_CONTRACT: &str = "rtinfer/1";
 
-const OPENAI_REALTIME_MODELS: &[&str] = &["gpt-realtime-2", "gpt-realtime-mini"];
+const OPENAI_REALTIME_MODELS: &[&str] = &[
+    "gpt-realtime",
+    "gpt-realtime-1.5",
+    "gpt-realtime-2",
+    "gpt-realtime-mini",
+];
 const REALTIME_REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high"];
+const REASONING_MODEL: &str = "gpt-realtime-2";
 
 /// Warm Realtime sockets kept per model. The realtime fan-out (navigators +
 /// scorer) issues a handful of concurrent asks; 4 independent warm sessions per
@@ -202,13 +208,19 @@ fn normalize_reasoning_effort(effort: Option<&str>) -> Result<Option<String>, St
 }
 
 fn request_reasoning_effort(req: &OpenAiChatRequest) -> Result<Option<String>, String> {
-    normalize_reasoning_effort(
-        req.reasoning
-            .as_ref()
-            .and_then(|r| r.effort.as_deref())
-            .or(req.reasoning_effort.as_deref())
-            .or(req.reasoning_effort_camel.as_deref()),
-    )
+    let requested = req
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.effort.as_deref())
+        .or(req.reasoning_effort.as_deref())
+        .or(req.reasoning_effort_camel.as_deref());
+    if req.model != REASONING_MODEL && requested.is_some() {
+        return Err(format!(
+            "reasoning is only supported for {REASONING_MODEL}, not {}",
+            req.model
+        ));
+    }
+    normalize_reasoning_effort(requested)
 }
 
 fn openai_content_text(content: &Option<Value>) -> Result<String, String> {
@@ -607,6 +619,18 @@ mod tests {
     #[test]
     fn invalid_reasoning_effort_is_rejected() {
         assert!(normalize_reasoning_effort(Some("xhigh")).is_err());
+    }
+
+    #[test]
+    fn reasoning_is_rejected_for_non_reasoning_models() {
+        let req: OpenAiChatRequest = serde_json::from_value(json!({
+            "model": "gpt-realtime-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning": {"effort": "low"}
+        }))
+        .unwrap();
+        let err = request_reasoning_effort(&req).unwrap_err();
+        assert!(err.contains("only supported for gpt-realtime-2"));
     }
 
     #[test]

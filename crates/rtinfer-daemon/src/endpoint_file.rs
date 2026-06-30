@@ -39,6 +39,7 @@ pub fn path() -> Option<PathBuf> {
 
 /// Read the advertised daemon PID from the (release) endpoint file, if present.
 /// Used by `install` to detect and drain a running instance.
+#[cfg(target_os = "macos")]
 pub fn read_pid() -> Option<u32> {
     let p = dir().map(|d| d.join("endpoint.json"))?;
     let body = std::fs::read_to_string(p).ok()?;
