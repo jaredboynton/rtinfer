@@ -1,4 +1,4 @@
-//! codex/responses transport — free gpt-5.5 over Codex OAuth.
+//! codex/responses transport — free gpt-5.4 over Codex OAuth.
 //!
 //! Distinct from [`crate::RealtimePool`]: the realtime API
 //! (`gpt-realtime-2`) and the codex/responses API speak different wire
@@ -50,8 +50,9 @@ use crate::{RealtimeError, DEFAULT_HANDSHAKE_TIMEOUT};
 /// codex/responses WebSocket endpoint (free over Codex OAuth).
 pub const CODEX_RESPONSES_URL: &str = "wss://chatgpt.com/backend-api/codex/responses";
 
-/// Model id. ChatGPT Business unlimited tokens.
-pub const CODEX_RESPONSES_MODEL: &str = "gpt-5.5";
+/// Default synthesis model. gpt-5.4 over Codex OAuth (ChatGPT Business
+/// unlimited tokens). Callers can override per-request via the `model` field.
+pub const CODEX_RESPONSES_MODEL: &str = "gpt-5.4";
 
 /// `originator` header value (matches the codex CLI; verified live).
 pub const CODEX_RESPONSES_ORIGINATOR: &str = "codex_cli_rs";
@@ -293,7 +294,7 @@ struct CachedAuth {
     fetched_at: Instant,
 }
 
-/// Free gpt-5.5 codex/responses pool. One strict-schema ask per call.
+/// Free gpt-5.4 codex/responses pool. One strict-schema ask per call.
 pub struct CodexResponsesPool {
     endpoint: String,
     model: String,
@@ -328,7 +329,7 @@ impl CodexResponsesPool {
         *self.cached_auth.write().await = None;
     }
 
-    /// Ask gpt-5.5 for a single strict-schema structured object.
+    /// Ask gpt-5.4 for a single strict-schema structured object.
     ///
     /// `schema` is normalised for strict mode (all props required,
     /// `additionalProperties:false`) before sending. Returns the parsed
