@@ -12,9 +12,13 @@
 //!
 //! A thread instead appends transcript records as individual
 //! `conversation.item.create` items on a dedicated socket's DEFAULT
-//! conversation, and runs each ask IN-conversation. The item prefix is
-//! append-only, so the provider's per-session prompt cache covers everything
-//! already appended; each ask pays only for the new items plus the question.
+//! conversation, and runs each ask OUT-OF-BAND (`response.create` with
+//! `conversation:"none"`) whose `input` carries `item_reference` entries
+//! pointing at the appended transcript items plus one inline question message.
+//! The conversation holds ONLY the transcript items — a byte-stable, append-only
+//! prefix that lands in the provider's per-session prompt cache. Each ask pays
+//! for only the new items (appended since the last ask) plus the question; the
+//! cached prefix is never re-processed.
 //!
 //! # Wire statelessness
 //!
@@ -33,12 +37,14 @@
 //!
 //! session.update pins instructions + the forced result tool for the thread's
 //! lifetime (a thread is per judge-family, so these are constant). Each ask
-//! appends new transcript items, then a question item, then `response.create`.
-//! The model's forced function call is answered with a synthetic
-//! `function_call_output` so the conversation never holds a dangling call.
-//! Nothing is ever deleted: deletion would shift the cached prefix. When the
-//! appended volume exceeds [`thread_max_chars`], the next ask reconnects and
-//! replays the (client-truncated) window instead.
+//! appends new transcript items to the conversation, then sends an out-of-band
+//! `response.create` (`conversation:"none"`) whose `input` references every
+//! appended item plus the inline question. The response (function call + output)
+//! is out-of-band: nothing is added to the conversation, so the prefix stays
+//! stable and the prompt cache survives across asks. Nothing is ever deleted:
+//! deletion would shift the cached prefix. When the appended volume exceeds
+//! [`thread_max_chars`], the next ask reconnects and replays the
+//! (client-truncated) window instead.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -156,19 +162,30 @@ fn item_create_frame(item: &ThreadItem) -> Value {
     })
 }
 
-fn question_frame(user: &str) -> Value {
-    json!({
-        "type": "conversation.item.create",
-        "item": {
-            "type": "message",
-            "role": "user",
-            "content": [{ "type": "input_text", "text": format!("QUESTION: {user}") }],
-        },
-    })
-}
-
-fn response_create_frame(reasoning_effort: Option<&str>) -> Value {
-    let mut response = json!({});
+/// Build an out-of-band `response.create` (`conversation:"none"`) whose `input`
+/// references every appended transcript item via `item_reference` (pulling them
+/// from the server-side conversation's prompt cache) plus one inline question
+/// message. The response is out-of-band: nothing is added to the conversation,
+/// so the transcript-only prefix stays stable and the prompt cache survives.
+fn response_create_frame(
+    appended_ids: &[String],
+    user: &str,
+    reasoning_effort: Option<&str>,
+) -> Value {
+    let mut input: Vec<Value> = appended_ids
+        .iter()
+        .map(|id| json!({ "type": "item_reference", "id": id }))
+        .collect();
+    input.push(json!({
+        "type": "message",
+        "role": "user",
+        "content": [{ "type": "input_text", "text": format!("QUESTION: {user}") }],
+    }));
+    let mut response = json!({
+        "conversation": "none",
+        "tool_choice": "required",
+        "input": input,
+    });
     if let Some(effort) = reasoning_effort {
         let effort = effort.trim().to_lowercase();
         if matches!(
@@ -179,17 +196,6 @@ fn response_create_frame(reasoning_effort: Option<&str>) -> Value {
         }
     }
     json!({ "type": "response.create", "response": response })
-}
-
-fn call_output_frame(call_id: &str) -> Value {
-    json!({
-        "type": "conversation.item.create",
-        "item": {
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": "{\"ok\":true}",
-        },
-    })
 }
 
 impl ThreadSession {
@@ -275,13 +281,16 @@ impl ThreadSession {
         }
         let total_items = st.appended_ids.len();
 
-        // Question + response, read to completion. Any error drops the socket
-        // so the next ask reconnects and replays.
+        // Out-of-band response: references the appended transcript items via
+        // item_reference + inline question. Nothing added to the conversation.
+        // Any error drops the socket so the next ask reconnects and replays.
+        // Clone the id list before the mutable borrow of st.live.
+        let appended_ids = st.appended_ids.clone();
         let live = st
             .live
             .as_mut()
             .ok_or_else(|| RealtimeError::Protocol("thread: no live socket".into()))?;
-        match Self::run_ask(&mut live.ws, user, reasoning_effort).await {
+        match Self::run_ask(&mut live.ws, &appended_ids, user, reasoning_effort).await {
             Ok((object, usage)) => Ok(ThreadAskOutcome {
                 object,
                 usage,
@@ -331,15 +340,21 @@ impl ThreadSession {
         })
     }
 
-    /// Send the question item + `response.create`, read to `response.done`,
-    /// and answer the forced function call so the conversation stays clean.
+    /// Send one out-of-band `response.create` referencing the appended
+    /// transcript items + inline question, read to `response.done`, and return
+    /// the structured object. The response is out-of-band: no function-call
+    /// closure is needed because nothing is added to the conversation.
     async fn run_ask(
         ws: &mut protocol::RealtimeWs,
+        appended_ids: &[String],
         user: &str,
         reasoning_effort: Option<&str>,
     ) -> Result<(Value, Option<Value>), RealtimeError> {
-        protocol::send_value(ws, &question_frame(user)).await?;
-        protocol::send_value(ws, &response_create_frame(reasoning_effort)).await?;
+        protocol::send_value(
+            ws,
+            &response_create_frame(appended_ids, user, reasoning_effort),
+        )
+        .await?;
 
         let deadline = Instant::now() + ASK_WALL_CLOCK;
         let mut text_fallback = String::new();
@@ -371,10 +386,8 @@ impl ThreadSession {
                     let usage = env.response.as_ref().and_then(|r| r.usage.clone());
                     let mut calls = protocol::extract_tool_calls(&env)?;
                     if let Some(call) = calls.drain(..).next() {
-                        // Close the loop so the conversation never holds a
-                        // dangling function_call. Best-effort: a send failure
-                        // here surfaces on the NEXT ask's read.
-                        let _ = protocol::send_value(ws, &call_output_frame(&call.call_id)).await;
+                        // Out-of-band: the function call is NOT in the
+                        // conversation, so no function_call_output is needed.
                         return Ok((call.arguments, usage));
                     }
                     if text_fallback.is_empty() {
@@ -567,16 +580,37 @@ mod tests {
     }
 
     #[test]
-    fn question_frame_is_prefixed() {
-        let f = question_frame("is it grounded?");
-        assert_eq!(f["item"]["content"][0]["text"], "QUESTION: is it grounded?");
+    fn response_frame_is_out_of_band_with_item_references() {
+        let ids = vec!["u000001_abcd".to_string(), "u000002_efgh".to_string()];
+        let f = response_create_frame(&ids, "is it grounded?", None);
+        assert_eq!(f["response"]["conversation"], "none");
+        assert_eq!(f["response"]["tool_choice"], "required");
+        // input = [item_reference...] + inline question
+        assert_eq!(f["response"]["input"][0]["type"], "item_reference");
+        assert_eq!(f["response"]["input"][0]["id"], "u000001_abcd");
+        assert_eq!(f["response"]["input"][1]["type"], "item_reference");
+        assert_eq!(f["response"]["input"][1]["id"], "u000002_efgh");
+        assert_eq!(f["response"]["input"][2]["type"], "message");
+        assert_eq!(
+            f["response"]["input"][2]["content"][0]["text"],
+            "QUESTION: is it grounded?"
+        );
+    }
+
+    #[test]
+    fn response_frame_empty_items_just_question() {
+        let f = response_create_frame(&[], "hello", None);
+        assert_eq!(f["response"]["conversation"], "none");
+        assert_eq!(f["response"]["input"].as_array().unwrap().len(), 1);
+        assert_eq!(f["response"]["input"][0]["type"], "message");
     }
 
     #[test]
     fn response_frame_validates_effort() {
-        let f = response_create_frame(Some("low"));
+        let ids = vec!["x".to_string()];
+        let f = response_create_frame(&ids, "q", Some("low"));
         assert_eq!(f["response"]["reasoning"]["effort"], "low");
-        let f = response_create_frame(Some("bogus"));
+        let f = response_create_frame(&ids, "q", Some("bogus"));
         assert!(f["response"].get("reasoning").is_none());
     }
 }

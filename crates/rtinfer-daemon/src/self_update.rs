@@ -81,6 +81,11 @@ fn write_last_attempt(version: &str) {
 pub fn spawn(shutdown: watch::Sender<bool>, check_interval: Duration) {
     if cfg!(debug_assertions) || std::env::var_os("RTINFER_SKIP_SELF_UPDATE").is_some() {
         info!("rtinfer: self-update disabled (debug build or RTINFER_SKIP_SELF_UPDATE)");
+        // Leak the sender so the receiver's `changed()` in `serve`'s
+        // graceful-shutdown future does not error immediately (all senders
+        // dropped) and trigger an instant drain + exit. The server then stays
+        // up until SIGINT/SIGTERM.
+        std::mem::forget(shutdown);
         return;
     }
     tokio::spawn(async move {
