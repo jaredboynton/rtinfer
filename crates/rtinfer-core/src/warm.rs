@@ -655,20 +655,20 @@ fn response_tools_frame(
 
 /// Lazily loads + caches auth for the pool, refreshing through the configured
 /// source (or `~/.codex/auth.json`) on demand.
-struct AuthLoader {
+pub(crate) struct AuthLoader {
     auth_source: Option<SharedCodexAuthSource>,
     cached: Mutex<Option<CodexAuth>>,
 }
 
 impl AuthLoader {
-    fn new(auth_source: Option<SharedCodexAuthSource>) -> Self {
+    pub(crate) fn new(auth_source: Option<SharedCodexAuthSource>) -> Self {
         Self {
             auth_source,
             cached: Mutex::new(None),
         }
     }
 
-    async fn load(&self, force: bool) -> Result<CodexAuth, RealtimeError> {
+    pub(crate) async fn load(&self, force: bool) -> Result<CodexAuth, RealtimeError> {
         let mut guard = self.cached.lock().await;
         if !force {
             if let Some(a) = guard.as_ref() {

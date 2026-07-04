@@ -22,7 +22,9 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rtinfer_core::{CodexResponsesPool, RealtimeTool, WarmSessionPool, WarmToolTurn};
+use rtinfer_core::{
+    CodexResponsesPool, RealtimeTool, ThreadItem, ThreadRegistry, WarmSessionPool, WarmToolTurn,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::info;
@@ -50,6 +52,9 @@ pub struct AppState {
     /// handshake). The realtime_structured tier dispatches here.
     pub warm_realtime: Arc<WarmSessionPool>,
     pub codex_responses_pool: Arc<CodexResponsesPool>,
+    /// Per-thread pinned sockets with server-side append-only conversations.
+    /// The realtime_thread_structured tier dispatches here.
+    pub realtime_threads: Arc<ThreadRegistry>,
 }
 
 impl AppState {
@@ -58,6 +63,7 @@ impl AppState {
         Arc::new(Self {
             warm_realtime: WarmSessionPool::new(WARM_SESSIONS_PER_MODEL, None),
             codex_responses_pool: CodexResponsesPool::builder().build(),
+            realtime_threads: ThreadRegistry::new(None),
         })
     }
 }
@@ -121,6 +127,13 @@ struct RtInferRequest {
     model: Option<String>,
     #[serde(default)]
     reasoning_effort: Option<String>,
+    /// realtime_thread_structured: stable client thread id (judge family key).
+    #[serde(default)]
+    thread_id: Option<String>,
+    /// realtime_thread_structured: FULL current transcript window as id'd items;
+    /// the daemon appends only what its thread socket has not yet seen.
+    #[serde(default)]
+    items: Option<Vec<ThreadItem>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1177,6 +1190,53 @@ async fn rtinfer(State(state): State<Arc<AppState>>, Json(req): Json<RtInferRequ
                 Err(e) => rtinfer_map_realtime_err("realtime_structured", e),
             }
         }
+        "realtime_thread_structured" => {
+            let (Some(name), Some(schema)) = (req.schema_name.as_deref(), req.schema.clone())
+            else {
+                return rtinfer_err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "realtime_thread_structured requires schema_name and schema",
+                    false,
+                );
+            };
+            let Some(thread_id) = req.thread_id.as_deref().filter(|t| !t.trim().is_empty()) else {
+                return rtinfer_err(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "realtime_thread_structured requires thread_id",
+                    false,
+                );
+            };
+            let items = req.items.clone().unwrap_or_default();
+            match state
+                .realtime_threads
+                .ask_structured(
+                    thread_id,
+                    &req.system,
+                    &req.user,
+                    name,
+                    schema,
+                    items,
+                    req.model.as_deref(),
+                    req.reasoning_effort.as_deref(),
+                )
+                .await
+            {
+                Ok(outcome) => Json(json!({
+                    "contract": RTINFER_CONTRACT, "ok": true, "tier": "realtime_thread_structured",
+                    "object": outcome.object, "model": req.model,
+                    "thread": {
+                        "appended": outcome.appended,
+                        "replayed": outcome.replayed,
+                        "total_items": outcome.total_items,
+                    },
+                    "usage": outcome.usage,
+                }))
+                .into_response(),
+                Err(e) => rtinfer_map_realtime_err("realtime_thread_structured", e),
+            }
+        }
         "responses_structured" => {
             let (Some(name), Some(schema)) = (req.schema_name.as_deref(), req.schema.clone())
             else {
@@ -1233,7 +1293,7 @@ async fn rtinfer_health(State(_state): State<Arc<AppState>>) -> Response {
         "contract": RTINFER_CONTRACT,
         "ready": ready,
         "provider": "rtinferd",
-        "tiers": ["realtime_structured", "responses_structured", "responses_text"],
+        "tiers": ["realtime_structured", "realtime_thread_structured", "responses_structured", "responses_text"],
     }))
     .into_response()
 }

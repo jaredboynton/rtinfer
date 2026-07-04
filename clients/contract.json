@@ -6,7 +6,7 @@
       "contract": "rtinfer/1",
       "ready": true,
       "provider": "rtinferd",
-      "tiers": ["realtime_structured", "responses_structured", "responses_text"]
+      "tiers": ["realtime_structured", "realtime_thread_structured", "responses_structured", "responses_text"]
     }
   },
   "tiers": {
@@ -21,6 +21,29 @@
         "model": "gpt-realtime-2"
       },
       "response_ok": { "contract": "rtinfer/1", "ok": true, "tier": "realtime_structured", "object": {}, "model": "gpt-realtime-2" }
+    },
+    "realtime_thread_structured": {
+      "request": {
+        "contract": "rtinfer/1",
+        "tier": "realtime_thread_structured",
+        "thread_id": "judge:arm:SESSION_ID",
+        "system": "...",
+        "user": "...",
+        "schema_name": "result",
+        "schema": { "type": "object", "properties": {} },
+        "items": [{ "id": "sha1-prefix-or-stable-id", "text": "..." }],
+        "model": "gpt-realtime-2",
+        "reasoning_effort": "low"
+      },
+      "response_ok": {
+        "contract": "rtinfer/1",
+        "ok": true,
+        "tier": "realtime_thread_structured",
+        "object": {},
+        "model": "gpt-realtime-2",
+        "thread": { "appended": 3, "replayed": false, "total_items": 17 },
+        "usage": { "total_tokens": 0, "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0 }
+      }
     },
     "responses_structured": {
       "request": {

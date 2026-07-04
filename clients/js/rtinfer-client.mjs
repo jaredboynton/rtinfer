@@ -6,7 +6,8 @@
 // wire contract changes.
 //
 // The daemon (rtinferd) serves the `rtinfer/1` loopback contract:
-//   POST /v1/infer            { contract, tier, system, user, schema?, schema_name?, model? }
+//   POST /v1/infer            { contract, tier, system, user, schema?, schema_name?, model?,
+//                               thread_id?, items?, reasoning_effort? }
 //   GET  /v1/infer/health     -> { contract, ready, provider, tiers }
 //
 // The daemon is the ONLY inference path: there is no live-realtime fallback.
@@ -181,6 +182,46 @@ export async function daemonAsk(namespace, req, { model = SCORER_MODEL } = {}) {
     model,
     reasoning_effort: req.reasoningEffort,
   });
+}
+
+// One structured thread ask (realtime_thread_structured): server-side pinned
+// conversation keyed by threadId. `items` is the FULL current transcript
+// window as { id, text } objects with client-stable ids; the daemon appends
+// only the unseen suffix (or replays on mismatch). Returns
+// { object, usage, thread } or null on a per-request error.
+export async function daemonAskThread(threadId, req, { model = SCORER_MODEL } = {}) {
+  const base = await discoverEndpoint();
+  if (!base) throw new DaemonUnreachable();
+  let resp;
+  try {
+    resp = await fetch(inferUrl(base), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contract: RTINFER_CONTRACT,
+        tier: "realtime_thread_structured",
+        thread_id: threadId,
+        system: req.system,
+        user: req.user,
+        schema: req.schema,
+        schema_name: req.schemaName || req.schema_name || "result",
+        items: req.items || [],
+        model,
+        reasoning_effort: req.reasoningEffort,
+      }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (e) {
+    throw new DaemonUnreachable(`rtinfer thread request failed: ${e.message}`);
+  }
+  let json = null;
+  try {
+    json = await resp.json();
+  } catch {
+    return null;
+  }
+  if (!resp.ok || !json || json.ok !== true || typeof json.object !== "object" || json.object === null) return null;
+  return { object: json.object, usage: json.usage ?? null, thread: json.thread ?? null };
 }
 
 // Batch of structured realtime asks. True parallelism comes from the server

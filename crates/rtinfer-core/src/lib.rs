@@ -30,6 +30,7 @@ mod auth;
 mod pool;
 mod protocol;
 mod responses;
+mod thread;
 mod warm;
 
 pub use auth::{
@@ -46,6 +47,7 @@ pub use responses::{
     CodexResponsesPool, CodexResponsesPoolBuilder, CODEX_RESPONSES_BETA, CODEX_RESPONSES_MODEL,
     CODEX_RESPONSES_ORIGINATOR, CODEX_RESPONSES_URL, CODEX_RESPONSES_USER_AGENT,
 };
+pub use thread::{ThreadAskOutcome, ThreadItem, ThreadRegistry};
 pub use warm::{WarmSessionPool, WarmToolTurn};
 
 /// Default Realtime endpoint; identical to the JS reference.
@@ -421,6 +423,10 @@ pub(crate) struct InboundEnvelope {
 pub(crate) struct RealtimeDoneResponse {
     #[serde(default)]
     pub output: Vec<RealtimeOutputItem>,
+    /// Provider token usage (`response.usage` on `response.done`). Surfaced by
+    /// the thread tier so clients can measure prompt-cache effectiveness.
+    #[serde(default)]
+    pub usage: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

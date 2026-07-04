@@ -6,7 +6,8 @@ do not fork it. The matching JS client lives at clients/js/rtinfer-client.mjs
 and MUST be edited in lockstep when the wire contract changes.
 
 The daemon (rtinferd) serves the `rtinfer/1` loopback contract:
-  POST /v1/infer            {contract, tier, system, user, schema?, schema_name?, model?}
+  POST /v1/infer            {contract, tier, system, user, schema?, schema_name?, model?,
+                             thread_id?, items?, reasoning_effort?}
   GET  /v1/infer/health     -> {contract, ready, provider, tiers}
 
 This is a *preferred* path for borrowing the shared daemon, never a required
@@ -180,6 +181,69 @@ def ask_structured(
         return None, None
     return obj, None
 
+
+def ask_thread_structured(
+    thread_id: str,
+    system: str,
+    user: str,
+    schema: dict[str, Any],
+    items: list[dict[str, str]],
+    *,
+    schema_name: str = "result",
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    timeout: float = REQUEST_TIMEOUT,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """One structured ask over the daemon's realtime_thread_structured tier.
+
+    ``items`` is the FULL current transcript window as ``{"id", "text"}`` dicts
+    with client-stable ids; the daemon appends only the suffix it has not seen
+    on ``thread_id``'s pinned socket (or replays the whole window on mismatch).
+
+    Returns ``(object, meta)`` on success where ``meta`` holds the daemon's
+    ``usage`` (provider token counts, may be None) and ``thread`` accounting
+    (``appended`` / ``replayed`` / ``total_items``); ``(None, None)`` signals
+    fallback to the stateless path."""
+    base = discover()
+    if base is None:
+        return None, None
+    body: dict[str, Any] = {
+        "contract": CONTRACT,
+        "tier": "realtime_thread_structured",
+        "thread_id": thread_id,
+        "system": system,
+        "user": user,
+        "schema": schema,
+        "schema_name": schema_name,
+        "items": items,
+    }
+    if model:
+        body["model"] = model
+    if reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
+    payload = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        base + "/v1/infer",
+        data=payload,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (loopback only)
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        _invalidate()
+        return None, None
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        return None, None
+    obj = data.get("object")
+    if not isinstance(obj, dict):
+        return None, None
+    meta = {
+        "usage": data.get("usage") if isinstance(data.get("usage"), dict) else None,
+        "thread": data.get("thread") if isinstance(data.get("thread"), dict) else None,
+    }
+    return obj, meta
 
 def ask_text(
     system: str,
