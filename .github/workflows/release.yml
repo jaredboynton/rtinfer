@@ -26,14 +26,21 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
             echo "invalid version: $version" >&2; exit 1; }
+          # Refuse only when the release is already COMPLETE (all three
+          # packages published). A partial publish (some packages missing)
+          # must be retryable; the publish job skips existing versions.
+          missing=0
           for p in \
             @jaredboynton/rtinfer \
             @jaredboynton/rtinfer-darwin-arm64 \
             @jaredboynton/rtinfer-linux-arm64; do
-            if npm view "$p@$version" version >/dev/null 2>&1; then
-              echo "refusing to republish existing: $p@$version" >&2; exit 1
+            if ! npm view "$p@$version" version >/dev/null 2>&1; then
+              missing=1
             fi
           done
+          if [ "$missing" -eq 0 ]; then
+            echo "refusing to republish: $version is fully published" >&2; exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   build:
@@ -103,8 +110,20 @@ jobs:
           # `packages/<name>` argument for a GitHub git shorthand (which would
           # make it try `git ls-remote ssh://git@github.com/packages/<name>.git`
           # and fail with exit 128).
-          (cd packages/darwin-arm64 && npm publish --access public)
-          (cd packages/linux-arm64 && npm publish --access public)
+          #
+          # Idempotent: skip any package whose version already exists, so a
+          # partially-published tag can be retried without E403 aborting the
+          # remaining packages (v0.1.6 shipped darwin then died before linux).
+          publish_once() {
+            local pkg="$1" dir="$2"
+            if npm view "$pkg@${{ needs.resolve-version.outputs.version }}" version >/dev/null 2>&1; then
+              echo "skip: $pkg@${{ needs.resolve-version.outputs.version }} already published"
+              return 0
+            fi
+            (cd "$dir" && npm publish --access public)
+          }
+          publish_once @jaredboynton/rtinfer-darwin-arm64 packages/darwin-arm64
+          publish_once @jaredboynton/rtinfer-linux-arm64 packages/linux-arm64
           # Meta package last so the latest dist-tag only advances once the
           # platform subpackages exist.
-          (cd packages/js-wrapper && npm publish --access public)
+          publish_once @jaredboynton/rtinfer packages/js-wrapper
