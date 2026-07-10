@@ -51,3 +51,12 @@ test("linux release cache warmer shares release fingerprints", () => {
   assert.match(timing, /resolve-boringssl-prebuild\.sh/);
   assert.match(timing, /actions\/cache\/save@v4/);
 });
+
+test("auto-tag explicitly dispatches release because GITHUB_TOKEN tag pushes do not chain", () => {
+  const autoTag = read(".github/workflows/auto-tag.yml");
+  const release = read(".github/workflows/release.yml");
+
+  assert.match(autoTag, /actions:\s*write/);
+  assert.match(autoTag, /gh workflow run release\.yml --ref \"\$tag\"/);
+  assert.match(release, /workflow_dispatch:/);
+});

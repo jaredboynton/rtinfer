@@ -2,14 +2,15 @@ name: auto-tag
 
 # Fully automatic release trigger: when a version bump lands on main (via
 # scripts/set-version.sh + a normal commit), this verifies the workspace and
-# pushes the matching `vX.Y.Z` tag. The tag push then fires release.yml
-# (build matrix -> npm publish). No manual tag step is required.
+# pushes the matching `vX.Y.Z` tag, then explicitly dispatches release.yml.
+# GITHUB_TOKEN tag pushes do not trigger another workflow automatically.
 
 on:
   push:
     branches: [main]
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -60,3 +61,11 @@ jobs:
           tag="v${{ steps.v.outputs.version }}"
           git tag "$tag"
           git push origin "$tag"
+      - name: Dispatch release
+        if: steps.gate.outputs.exists == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v${{ steps.v.outputs.version }}"
+          gh workflow run release.yml --ref "$tag"
