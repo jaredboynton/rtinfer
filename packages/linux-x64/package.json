@@ -1,0 +1,19 @@
+{
+  "name": "@jaredboynton/rtinfer-linux-x64",
+  "version": "0.1.6",
+  "description": "Linux x64 binary for @jaredboynton/rtinfer",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaredboynton/rtinfer.git"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/rtinferd"
+  ]
+}

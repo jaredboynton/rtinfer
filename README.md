@@ -48,8 +48,11 @@ rtinferd status                   # show ~/.cse-rtinfer/endpoint.json
 rtinferd uninstall
 ```
 
-The daemon owns its own port (default **8765**) and advertises the live URL in
-`~/.cse-rtinfer/endpoint.json` on boot. cse-tools' cockpit keeps 8787.
+Optional platform packages ship the native binary for `darwin-arm64`,
+`linux-arm64`, and `linux-x64`. The daemon owns its own port (default **8765**)
+and advertises the live URL in `~/.cse-rtinfer/endpoint.json` on boot.
+Linux releases enforce a GLIBC 2.35 ceiling (Ubuntu 22.04 or equivalent).
+cse-tools' cockpit keeps 8787.
 
 ## Sticky Routing
 

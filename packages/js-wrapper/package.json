@@ -24,6 +24,7 @@
   },
   "optionalDependencies": {
     "@jaredboynton/rtinfer-darwin-arm64": "0.1.6",
-    "@jaredboynton/rtinfer-linux-arm64": "0.1.6"
+    "@jaredboynton/rtinfer-linux-arm64": "0.1.6",
+    "@jaredboynton/rtinfer-linux-x64": "0.1.6"
   }
 }
