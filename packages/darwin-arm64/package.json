@@ -1,6 +1,6 @@
 {
   "name": "@jaredboynton/rtinfer-darwin-arm64",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Apple Silicon binary for @jaredboynton/rtinfer",
   "license": "MIT",
   "repository": {
