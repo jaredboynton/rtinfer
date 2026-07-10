@@ -146,6 +146,14 @@ jobs:
           done
           # Vendor canonical clients into the published meta package.
           bash scripts/sync-clients.sh
+          pack_json=$(npm pack ./packages/js-wrapper --dry-run --json)
+          PACK_JSON="$pack_json" node <<'EOF'
+          const packed = JSON.parse(process.env.PACK_JSON);
+          const shim = packed[0]?.files?.find((file) => file.path === 'bin/rtinferd.js');
+          if (!shim || shim.mode !== 0o755) {
+            throw new Error('meta package must contain executable bin/rtinferd.js');
+          }
+          EOF
       - name: Publish to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -201,11 +209,12 @@ jobs:
                 --fetch-retry-mintimeout 10000 \
                 --fetch-retry-maxtimeout 60000 \
                 "@jaredboynton/rtinfer@$VERSION"; then
-              if version_output=$(./node_modules/.bin/rtinferd --version 2>/dev/null) \
-                  && [ "$version_output" = "rtinferd $VERSION" ]; then
+              version_output=$(./node_modules/.bin/rtinferd --version 2>&1 || true)
+              if [ "$version_output" = "rtinferd $VERSION" ]; then
                 verified=1
                 break
               fi
+              echo "resolved runtime output: $version_output" >&2
             fi
             echo "linux-x64 install/resolve attempt $attempt/36 failed; waiting for npm propagation" >&2
             sleep 10

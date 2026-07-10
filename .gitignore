@@ -5,6 +5,8 @@ Cargo.lock.orig
 # npm
 node_modules/
 packages/*/bin/
+!packages/js-wrapper/bin/
+!packages/js-wrapper/bin/rtinferd.js
 packages/js-wrapper/clients/
 clients/js/node_modules/
 

@@ -1,9 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const root = new URL("../", import.meta.url);
 const read = (path) => readFileSync(new URL(path, root), "utf8");
+const cwd = fileURLToPath(root);
 
 test("linux-x64 is a first-class npm runtime", () => {
   const platform = JSON.parse(read("packages/linux-x64/package.json"));
@@ -59,4 +62,19 @@ test("auto-tag explicitly dispatches release because GITHUB_TOKEN tag pushes do 
   assert.match(autoTag, /actions:\s*write/);
   assert.match(autoTag, /gh workflow run release\.yml --ref \"\$tag\"/);
   assert.match(release, /workflow_dispatch:/);
+});
+
+test("the npm executable shim is tracked and packed as executable", () => {
+  assert.doesNotThrow(() => {
+    execFileSync("git", ["ls-files", "--error-unmatch", "packages/js-wrapper/bin/rtinferd.js"], { cwd });
+  });
+
+  const packed = JSON.parse(execFileSync(
+    "npm",
+    ["pack", "./packages/js-wrapper", "--dry-run", "--json"],
+    { cwd, encoding: "utf8" },
+  ));
+  const shim = packed[0].files.find((file) => file.path === "bin/rtinferd.js");
+  assert.ok(shim, "meta package must contain bin/rtinferd.js");
+  assert.equal(shim.mode, 0o755);
 });
