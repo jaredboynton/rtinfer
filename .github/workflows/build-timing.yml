@@ -1,0 +1,95 @@
+name: release build timing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "scripts/set-version.sh"
+      - "scripts/resolve-boringssl-prebuild.sh"
+      - ".github/workflows/build-timing.yml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+    inputs:
+      budget_seconds:
+        description: "Per-target release build budget"
+        required: false
+        default: "90"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rtinfer-release-build-timing-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-release-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64
+    runs-on: ${{ matrix.runner }}
+    env:
+      BUILD_BUDGET_SECONDS: ${{ inputs.budget_seconds || (github.event_name == 'push' && '600' || '90') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Restore release build cache
+        id: release-build-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/boringssl
+            target
+          key: cargo-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target }}-
+      - name: Use prebuilt BoringSSL
+        run: |
+          set -euo pipefail
+          eval "$(scripts/resolve-boringssl-prebuild.sh --print-env '${{ matrix.target }}')"
+          {
+            echo "BORING_BSSL_PATH=$BORING_BSSL_PATH"
+            echo "BORING_BSSL_INCLUDE_PATH=$BORING_BSSL_INCLUDE_PATH"
+          } >> "$GITHUB_ENV"
+      - name: Timed release build
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          timeout --foreground --kill-after=10s "${BUILD_BUDGET_SECONDS}s" \
+            cargo build --release -p rtinfer-daemon --target "${{ matrix.target }}"
+          elapsed=$((SECONDS - start))
+          binary="target/${{ matrix.target }}/release/rtinferd"
+          test -x "$binary"
+          "$binary" --version
+          {
+            echo "### ${{ matrix.platform }} release build"
+            echo
+            echo "- elapsed: ${elapsed}s"
+            echo "- budget: ${BUILD_BUDGET_SECONDS}s"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Save release build cache
+        if: always() && steps.release-build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/boringssl
+            target
+          key: ${{ steps.release-build-cache.outputs.cache-primary-key }}

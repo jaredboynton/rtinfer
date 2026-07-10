@@ -35,6 +35,7 @@ jobs:
         with:
           node-version: "20"
       - run: node --test clients/js/rtinfer-client.test.mjs
+      - run: node --test tests/release-contract.test.mjs
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

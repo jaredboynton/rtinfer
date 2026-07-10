@@ -1,7 +1,7 @@
 name: release
 
-# Build rtinferd for darwin-arm64 + linux-arm64 on tag push, then publish the
-# platform packages and the meta @jaredboynton/rtinfer wrapper to npm.
+# Build rtinferd for darwin-arm64 + Linux arm64/x64 on tag push, then publish
+# the platform packages and the meta @jaredboynton/rtinfer wrapper to npm.
 
 on:
   push:
@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: rtinfer-release
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   resolve-version:
@@ -26,20 +26,21 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
             echo "invalid version: $version" >&2; exit 1; }
-          # Refuse only when the release is already COMPLETE (all three
-          # packages published). A partial publish (some packages missing)
-          # must be retryable; the publish job skips existing versions.
+          # Existing packages are safe: publish_once skips them. This also
+          # lets a fully published but previously unverified run retry its
+          # registry install smoke without minting another version.
           missing=0
           for p in \
             @jaredboynton/rtinfer \
             @jaredboynton/rtinfer-darwin-arm64 \
-            @jaredboynton/rtinfer-linux-arm64; do
+            @jaredboynton/rtinfer-linux-arm64 \
+            @jaredboynton/rtinfer-linux-x64; do
             if ! npm view "$p@$version" version >/dev/null 2>&1; then
               missing=1
             fi
           done
           if [ "$missing" -eq 0 ]; then
-            echo "refusing to republish: $version is fully published" >&2; exit 1
+            echo "$version is fully published; continuing as a verification-only rerun"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -54,25 +55,68 @@ jobs:
           - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             platform: linux-arm64
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Restore release build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/boringssl
+            target
+          key: cargo-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target }}-
+      - name: Use prebuilt BoringSSL on Linux
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          set -euo pipefail
+          eval "$(scripts/resolve-boringssl-prebuild.sh --print-env '${{ matrix.target }}')"
+          {
+            echo "BORING_BSSL_PATH=$BORING_BSSL_PATH"
+            echo "BORING_BSSL_INCLUDE_PATH=$BORING_BSSL_INCLUDE_PATH"
+          } >> "$GITHUB_ENV"
       - name: Inject release version
         run: bash scripts/set-version.sh "${{ needs.resolve-version.outputs.version }}"
       - name: Build rtinferd (release)
         run: cargo build --release -p rtinfer-daemon --target ${{ matrix.target }}
       - name: Stage binary
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
         run: |
+          set -euo pipefail
           mkdir -p out/bin
           cp "target/${{ matrix.target }}/release/rtinferd" out/bin/rtinferd
           chmod +x out/bin/rtinferd
+          version_output=$(out/bin/rtinferd --version)
+          test "$version_output" = "rtinferd $VERSION"
+          if [[ "$PLATFORM" == linux-* ]]; then
+            binary_info=$(file out/bin/rtinferd)
+            echo "$binary_info"
+            echo "$binary_info" | grep -qi 'ELF'
+            if [ "$PLATFORM" = "linux-x64" ]; then
+              echo "$binary_info" | grep -qiE 'x86-64|x86_64'
+            else
+              echo "$binary_info" | grep -qiE 'aarch64|arm64'
+            fi
+            max_glibc=$(readelf --version-info out/bin/rtinferd | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sort -Vu | awk 'END { print }')
+            test -n "$max_glibc"
+            highest_glibc=$(printf '%s\n' "$max_glibc" GLIBC_2.35 | sort -V | awk 'END { print }')
+            test "$highest_glibc" = "GLIBC_2.35" || { echo "$PLATFORM requires newer than GLIBC_2.35: $max_glibc" >&2; exit 1; }
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: rtinferd-${{ matrix.platform }}
           path: out/bin/rtinferd
+          compression-level: 0
 
   publish:
     needs: [resolve-version, build]
@@ -94,7 +138,7 @@ jobs:
           # Stamp the tag version into every manifest so npm publishes match
           # the version baked into the built binary (keeps self-update stable).
           bash scripts/set-version.sh "$VERSION"
-          for platform in darwin-arm64 linux-arm64; do
+          for platform in darwin-arm64 linux-arm64 linux-x64; do
             mkdir -p "packages/$platform/bin"
             cp "dl/rtinferd-$platform/rtinferd" "packages/$platform/bin/rtinferd"
             chmod +x "packages/$platform/bin/rtinferd"
@@ -124,6 +168,59 @@ jobs:
           }
           publish_once @jaredboynton/rtinfer-darwin-arm64 packages/darwin-arm64
           publish_once @jaredboynton/rtinfer-linux-arm64 packages/linux-arm64
+          publish_once @jaredboynton/rtinfer-linux-x64 packages/linux-x64
           # Meta package last so the latest dist-tag only advances once the
           # platform subpackages exist.
           publish_once @jaredboynton/rtinfer packages/js-wrapper
+
+      - name: Smoke-test Linux x64 install from npm
+        timeout-minutes: 15
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+          RTINFER_SKIP_POSTINSTALL: "1"
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          cd "$tmp"
+          npm init -y >/dev/null
+
+          verified=0
+          for attempt in $(seq 1 36); do
+            rm -rf node_modules package-lock.json
+            cache="$RUNNER_TEMP/npm-live-cache-$attempt"
+            rm -rf "$cache"
+            if timeout 60s npm install \
+                --prefer-online \
+                --include=optional \
+                --os=linux \
+                --cpu=x64 \
+                --cache "$cache" \
+                --fetch-retries 5 \
+                --fetch-retry-mintimeout 10000 \
+                --fetch-retry-maxtimeout 60000 \
+                "@jaredboynton/rtinfer@$VERSION"; then
+              if version_output=$(./node_modules/.bin/rtinferd --version 2>/dev/null) \
+                  && [ "$version_output" = "rtinferd $VERSION" ]; then
+                verified=1
+                break
+              fi
+            fi
+            echo "linux-x64 install/resolve attempt $attempt/36 failed; waiting for npm propagation" >&2
+            sleep 10
+          done
+          test "$verified" = "1"
+          node <<'EOF'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const platformPkg = require.resolve('@jaredboynton/rtinfer-linux-x64/package.json');
+          fs.accessSync(path.join(path.dirname(platformPkg), 'bin', 'rtinferd'), fs.constants.X_OK);
+          for (const other of ['@jaredboynton/rtinfer-darwin-arm64', '@jaredboynton/rtinfer-linux-arm64']) {
+            try {
+              require.resolve(`${other}/package.json`);
+              throw new Error(`${other} should not be installed on linux-x64`);
+            } catch (error) {
+              if (error.code !== 'MODULE_NOT_FOUND') throw error;
+            }
+          }
+          EOF

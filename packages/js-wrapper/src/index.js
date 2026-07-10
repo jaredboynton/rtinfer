@@ -17,7 +17,7 @@ function nativeBinaryName(platform) {
 
 function resolveCoreBinary() {
   const platformKey = `${process.platform}-${process.arch}`;
-  const supportedPlatforms = new Set(['darwin-arm64', 'linux-arm64']);
+  const supportedPlatforms = new Set(['darwin-arm64', 'linux-arm64', 'linux-x64']);
   const binaryName = nativeBinaryName(process.platform);
 
   if (supportedPlatforms.has(platformKey)) {

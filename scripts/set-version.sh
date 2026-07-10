@@ -11,6 +11,7 @@
 #   - packages/js-wrapper/package.json version + optionalDependencies pins
 #   - packages/darwin-arm64/package.json version
 #   - packages/linux-arm64/package.json version
+#   - packages/linux-x64/package.json version
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,6 +20,7 @@ CARGO_TOML="$ROOT/Cargo.toml"
 JS_WRAPPER="$ROOT/packages/js-wrapper/package.json"
 DARWIN="$ROOT/packages/darwin-arm64/package.json"
 LINUX="$ROOT/packages/linux-arm64/package.json"
+LINUX_X64="$ROOT/packages/linux-x64/package.json"
 
 cargo_version() {
   awk '/^\[workspace\.package\]/{f=1} f&&/^version *= *"/{gsub(/^version *= *"|".*$/,"");print;exit}' "$CARGO_TOML"
@@ -40,13 +42,13 @@ set_cargo_version() {
 
 set_pkg_version() {
   local file="$1" v="$2"
-  # Top-level "version": "..." (first occurrence) and the two optionalDependencies pins.
+  # Top-level "version": "..." (first occurrence) and the optionalDependencies pins.
   awk -v v="$v" '
     !done_version && /"version"[[:space:]]*:/ {
       sub(/"version"[[:space:]]*:[[:space:]]*"[^"]*"/, "\"version\": \"" v "\"")
       done_version=1
     }
-    /@jaredboynton\/rtinfer-(darwin-arm64|linux-arm64)"[[:space:]]*:/ {
+    /@jaredboynton\/rtinfer-(darwin-arm64|linux-arm64|linux-x64)"[[:space:]]*:/ {
       sub(/:[[:space:]]*"[^"]*"/, ": \"" v "\"")
     }
     { print }
@@ -55,14 +57,16 @@ set_pkg_version() {
 }
 
 check() {
-  local cargo js darwin linux
+  local cargo js darwin linux linux_x64
   cargo="$(cargo_version)"
   js="$(pkg_version "$JS_WRAPPER")"
   darwin="$(pkg_version "$DARWIN")"
   linux="$(pkg_version "$LINUX")"
-  local opt_darwin opt_linux
+  linux_x64="$(pkg_version "$LINUX_X64")"
+  local opt_darwin opt_linux opt_linux_x64
   opt_darwin="$(awk -F'"' '/@jaredboynton\/rtinfer-darwin-arm64"/{print $4;exit}' "$JS_WRAPPER")"
   opt_linux="$(awk -F'"' '/@jaredboynton\/rtinfer-linux-arm64"/{print $4;exit}' "$JS_WRAPPER")"
+  opt_linux_x64="$(awk -F'"' '/@jaredboynton\/rtinfer-linux-x64"/{print $4;exit}' "$JS_WRAPPER")"
 
   local ok=1
   for pair in \
@@ -70,13 +74,17 @@ check() {
     "js-wrapper=$js" \
     "darwin-arm64=$darwin" \
     "linux-arm64=$linux" \
+    "linux-x64=$linux_x64" \
     "optionalDependencies.darwin=$opt_darwin" \
-    "optionalDependencies.linux=$opt_linux"; do
+    "optionalDependencies.linux=$opt_linux" \
+    "optionalDependencies.linux-x64=$opt_linux_x64"; do
     echo "  ${pair%%=*}: ${pair#*=}"
   done
 
   if [ "$cargo" = "$js" ] && [ "$js" = "$darwin" ] && [ "$darwin" = "$linux" ] \
-     && [ "$opt_darwin" = "$cargo" ] && [ "$opt_linux" = "$cargo" ]; then
+     && [ "$linux" = "$linux_x64" ] \
+     && [ "$opt_darwin" = "$cargo" ] && [ "$opt_linux" = "$cargo" ] \
+     && [ "$opt_linux_x64" = "$cargo" ]; then
     echo "version: all manifests agree on $cargo"
   else
     echo "version drift detected" >&2
@@ -101,6 +109,7 @@ main() {
   set_pkg_version "$JS_WRAPPER" "$version"
   set_pkg_version "$DARWIN" "$version"
   set_pkg_version "$LINUX" "$version"
+  set_pkg_version "$LINUX_X64" "$version"
 
   # Keep Cargo.lock in lockstep so the build is deterministic.
   if command -v cargo >/dev/null 2>&1; then
