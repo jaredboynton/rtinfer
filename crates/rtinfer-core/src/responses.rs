@@ -11,7 +11,7 @@
 //! # Endpoint + cost
 //!
 //! `wss://chatgpt.com/backend-api/codex/responses` authenticated with
-//! the Codex OAuth token (`~/.codex/auth.json` or daemon keychain).
+//! the Codex OAuth token (`~/.codex/auth.json` or an injected auth source).
 //! On a ChatGPT Business account this is **free** (`codex.rate_limits`
 //! frame reports `plan_type:"business"`, `credits.unlimited:true`). The
 //! paid `api.openai.com/v1/responses` API-key path is deliberately NOT
@@ -221,8 +221,7 @@ impl CodexResponsesPoolBuilder {
         self.auth_ttl = Some(ttl);
         self
     }
-    /// Seed an explicit [`CodexAuth`] (the daemon passes keychain-derived
-    /// auth here so the pool never reads `~/.codex/auth.json`).
+    /// Seed explicit auth so the pool never reads `~/.codex/auth.json`.
     pub fn initial_auth(mut self, auth: CodexAuth) -> Self {
         self.initial_auth = Some(auth);
         self
@@ -234,9 +233,8 @@ impl CodexResponsesPoolBuilder {
 
     /// Supply a pluggable [`CodexAuthSource`](crate::CodexAuthSource). When
     /// set, the pool calls it for every cold/stale load and after a handshake
-    /// rejection, ignoring `auth_path`. The daemon passes a keychain-backed
-    /// source so the pool re-mints through okta-aio instead of reading
-    /// `~/.codex/auth.json`.
+    /// rejection, ignoring `auth_path`. Credential-process mode uses this to
+    /// prevent any fallback to `~/.codex/auth.json`.
     pub fn auth_source(mut self, source: SharedCodexAuthSource) -> Self {
         self.auth_source = Some(source);
         self
@@ -256,8 +254,8 @@ impl CodexResponsesPoolBuilder {
         };
         let auth_ttl = self.auth_ttl.unwrap_or(DEFAULT_AUTH_TTL);
         // Eager pre-load only for the file path. With an explicit
-        // `auth_source` the first ask loads lazily through it (a keychain read
-        // / okta-aio re-mint must not run synchronously in `build`).
+        // `auth_source` the first ask loads lazily through it; an external
+        // credential operation must not run synchronously in `build`.
         let cached = match self.initial_auth.clone() {
             Some(auth) => Some(CachedAuth {
                 auth,
@@ -423,8 +421,8 @@ impl CodexResponsesPool {
             }
         }
         // A `CodexAuthSource` owns its own staleness handling: the file source
-        // does the client-side OAuth rotation; the keychain source re-mints
-        // through okta-aio. The path branch keeps the legacy proactive refresh.
+        // does the client-side OAuth rotation; external sources own refresh.
+        // The path branch keeps the legacy proactive refresh.
         let auth = match self.auth_source.as_ref() {
             Some(source) => source.load().await?,
             None => {
@@ -471,13 +469,19 @@ impl CodexResponsesPool {
             }
         }
         let fresh = match self.auth_source.as_ref() {
-            Some(source) => source.force_refresh().await?,
+            Some(source) => source.force_refresh(stale_access_token).await?,
             None => {
                 let base = match self.auth_path.as_deref() {
                     Some(p) => CodexAuth::from_path(p)?,
                     None => CodexAuth::from_default_path()?,
                 };
-                base.refresh().await?
+                // Mirror FileCodexAuthSource: if another writer already rotated
+                // past the rejected token, reuse it instead of refreshing again.
+                if base.access_token != stale_access_token {
+                    base
+                } else {
+                    base.refresh().await?
+                }
             }
         };
         *guard = Some(CachedAuth {
@@ -707,6 +711,61 @@ fn install_rustls_provider() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    struct RecordingSource {
+        rejected: StdMutex<Vec<String>>,
+    }
+
+    fn source_auth(access_token: &str) -> CodexAuth {
+        CodexAuth {
+            access_token: access_token.into(),
+            account_id: "acct".into(),
+            id_token: String::new(),
+            refresh_token: String::new(),
+            source_path: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::CodexAuthSource for RecordingSource {
+        async fn load(&self) -> Result<CodexAuth, RealtimeError> {
+            Ok(source_auth("loaded-access"))
+        }
+
+        async fn force_refresh(
+            &self,
+            rejected_access_token: &str,
+        ) -> Result<CodexAuth, RealtimeError> {
+            self.rejected
+                .lock()
+                .unwrap()
+                .push(rejected_access_token.into());
+            Ok(source_auth("forced-access"))
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_force_passes_rejected_access_to_source() {
+        let source = Arc::new(RecordingSource {
+            rejected: StdMutex::new(Vec::new()),
+        });
+        let pool = CodexResponsesPool::builder()
+            .auth_source(source.clone())
+            .build();
+
+        let loaded = pool.fresh_auth().await.unwrap();
+        let forced = pool
+            .force_refresh_after(&loaded.access_token)
+            .await
+            .unwrap();
+
+        assert_eq!(forced.access_token, "forced-access");
+        assert_eq!(
+            source.rejected.lock().unwrap().as_slice(),
+            ["loaded-access"]
+        );
+    }
 
     #[test]
     fn normaliser_fills_required_and_blocks_additional() {

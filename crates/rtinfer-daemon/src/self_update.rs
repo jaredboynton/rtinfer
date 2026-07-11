@@ -11,7 +11,7 @@
 //!
 //! This mirrors the SPIRIT of cse-toold's self-update without its
 //! signature/codesign state machine: rtinferd is loopback-only, reads only
-//! `~/.codex/auth.json`, and has no keychain/TCC/codesign pinning (see
+//! file or credential-process auth, and has no keychain/TCC/codesign pinning (see
 //! `install.rs`), so a signed multi-phase installer would be unjustified weight.
 //!
 //! # Fail-open

@@ -149,8 +149,7 @@ impl RealtimePoolBuilder {
 
     /// Supply a pluggable [`CodexAuthSource`](crate::CodexAuthSource). When
     /// set, the pool loads auth through it (ignoring `auth_path`); the daemon
-    /// passes a keychain-backed source so the pool never reads
-    /// `~/.codex/auth.json`.
+    /// passes an external source so the pool never reads `~/.codex/auth.json`.
     pub fn auth_source(mut self, source: SharedCodexAuthSource) -> Self {
         self.auth_source = Some(source);
         self
@@ -170,8 +169,8 @@ impl RealtimePoolBuilder {
         let auth_ttl = self.auth_ttl.unwrap_or(DEFAULT_AUTH_TTL);
 
         // Eager pre-load only for the file path. With an explicit
-        // `auth_source` the first ask loads lazily through it (a keychain read
-        // / okta-aio re-mint must not run synchronously in `build`).
+        // `auth_source` the first ask loads lazily through it; an external
+        // credential operation must not run synchronously in `build`.
         let cached = match self.initial_auth.clone() {
             Some(auth) => Some(CachedAuth {
                 auth,

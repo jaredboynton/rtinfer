@@ -6,10 +6,11 @@ structured navigation/scoring, `gpt-5.x` codex/responses for synthesis) and
 lends them to any local client (cse-tools' `cse-sweep`, unifable's judge, ...)
 so each tool borrows one warm daemon instead of spawning its own.
 
-Auth is **file-only**: both pools read `~/.codex/auth.json` and rotate the
-short-lived `id_token` through the OAuth `refresh_token` grant. The daemon never
-reads process env for credentials and never touches a keychain. The loopback
-bind is the trust boundary; there is no wire auth header.
+Auth defaults to `~/.codex/auth.json`, including client-side rotation of its
+short-lived tokens. Production callers can instead configure an absolute
+`cse-toold` binary as a credential process. In that mode one shared source feeds
+all pools, `auth.json` is never a fallback, and rtinfer never receives a refresh
+token. The loopback bind is the trust boundary; there is no wire auth header.
 
 ## Layout
 
@@ -26,7 +27,7 @@ scripts/                 sync-clients.sh (release), dev-link.sh (local symlinks)
 ## Contract: `rtinfer/1`
 
 ```
-GET  /v1/infer/health  -> { contract, ready, provider, tiers }
+GET  /v1/infer/health  -> { contract, ready, provider, auth_source, tiers }
 POST /v1/infer         { contract, tier, system, user, schema?, schema_name?, model? }
 ```
 
@@ -44,6 +45,7 @@ npm i -g @jaredboynton/rtinfer    # postinstall runs `rtinferd install`
 # or manually:
 rtinferd install                  # macOS LaunchAgent, KeepAlive, RunAtLoad
 rtinferd serve --port 8765        # foreground
+rtinferd serve --cse-toold-bin /absolute/path/to/cse-toold
 rtinferd status                   # show ~/.cse-rtinfer/endpoint.json
 rtinferd uninstall
 ```
@@ -53,6 +55,12 @@ Optional platform packages ship the native binary for `darwin-arm64`,
 and advertises the live URL in `~/.cse-rtinfer/endpoint.json` on boot.
 Linux releases enforce a GLIBC 2.35 ceiling (Ubuntu 22.04 or equivalent).
 cse-tools' cockpit keeps 8787.
+
+`RTINFER_CSE_TOOLD_BIN` is the environment equivalent of
+`--cse-toold-bin`. rtinfer executes that path directly (never through a shell)
+as `codex-lease --min-valid-for-seconds 300`; health reports `ready:false` if
+the configured provider cannot return a valid v1 lease. Omit both settings to
+keep the default file-auth behavior.
 
 ## Sticky Routing
 

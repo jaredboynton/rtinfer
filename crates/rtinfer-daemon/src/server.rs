@@ -5,15 +5,14 @@
 //! HTTP contract so any client on the machine (cse-sweep, unifable judge,
 //! ...) borrows one warm pool instead of spawning its own realtime daemon.
 //!
-//! Auth is file-only by default: both pools read `~/.codex/auth.json` and
-//! perform the client-side OAuth `refresh_token` rotation when the short-lived
-//! `id_token` lapses (see `rtinfer_core::auth`). The server NEVER reads process
-//! env for credentials and NEVER touches a keychain.
+//! Auth is file-based by default. With an explicit cse-toold binary, every pool
+//! shares one credential-process source and never falls back to `auth.json`.
 //!
 //! The server binds `127.0.0.1` only; there is no auth header on the wire
 //! because the loopback bind is the trust boundary.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,7 +22,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rtinfer_core::{
-    CodexResponsesPool, RealtimeTool, ThreadItem, ThreadRegistry, WarmSessionPool, WarmToolTurn,
+    CodexResponsesPool, RealtimeTool, SharedCodexAuthSource, ThreadItem, ThreadRegistry,
+    WarmSessionPool, WarmToolTurn,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -55,6 +55,9 @@ pub struct AppState {
     /// Per-thread pinned sockets with server-side append-only conversations.
     /// The realtime_thread_structured tier dispatches here.
     pub realtime_threads: Arc<ThreadRegistry>,
+    /// Present only in credential-process mode. Health loads this exact source;
+    /// file mode keeps the legacy direct `auth.json` check.
+    auth_source: Option<SharedCodexAuthSource>,
 }
 
 impl AppState {
@@ -64,6 +67,25 @@ impl AppState {
             warm_realtime: WarmSessionPool::new(WARM_SESSIONS_PER_MODEL, None),
             codex_responses_pool: CodexResponsesPool::builder().build(),
             realtime_threads: ThreadRegistry::new(None),
+            auth_source: None,
+        })
+    }
+
+    /// Build all pools around one shared credential-process source.
+    pub fn new_cse_toold(bin: PathBuf) -> Result<Arc<Self>, rtinfer_core::RealtimeError> {
+        let source: SharedCodexAuthSource =
+            crate::cse_toold_auth::CseTooldCodexAuthSource::shared(bin)?;
+        Ok(Self::new_with_auth_source(source))
+    }
+
+    fn new_with_auth_source(source: SharedCodexAuthSource) -> Arc<Self> {
+        Arc::new(Self {
+            warm_realtime: WarmSessionPool::new(WARM_SESSIONS_PER_MODEL, Some(source.clone())),
+            codex_responses_pool: CodexResponsesPool::builder()
+                .auth_source(source.clone())
+                .build(),
+            realtime_threads: ThreadRegistry::new(Some(source.clone())),
+            auth_source: Some(source),
         })
     }
 }
@@ -83,8 +105,11 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// Bind `127.0.0.1:{port}`, write the well-known endpoint file, and serve until
 /// the process is killed or a newer npm release is self-installed (drain+exit so
 /// launchd respawns the updated shim).
-pub async fn serve(port: u16) -> anyhow::Result<()> {
-    let state = AppState::new_file_auth();
+pub async fn serve(port: u16, cse_toold_bin: Option<PathBuf>) -> anyhow::Result<()> {
+    let state = match cse_toold_bin {
+        Some(bin) => AppState::new_cse_toold(bin)?,
+        None => AppState::new_file_auth(),
+    };
     let app = router(state);
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1284,15 +1309,23 @@ async fn rtinfer(State(state): State<Arc<AppState>>, Json(req): Json<RtInferRequ
     }
 }
 
-async fn rtinfer_health(State(_state): State<Arc<AppState>>) -> Response {
-    // `ready` reflects whether file-based Codex credentials are reachable.
+async fn rtinfer_health(State(state): State<Arc<AppState>>) -> Response {
+    // Validate the configured source. Provider mode must not fall back to a
+    // readable auth.json when its credential process fails.
     // A client treats `ready:false` as "present but warming" and retries
     // briefly rather than failing loud.
-    let ready = rtinfer_core::CodexAuth::from_default_path().is_ok();
+    let (ready, auth_source) = match state.auth_source.as_ref() {
+        Some(source) => (source.load().await.is_ok(), "cse-toold"),
+        None => (
+            rtinfer_core::CodexAuth::from_default_path().is_ok(),
+            "auth.json",
+        ),
+    };
     Json(json!({
         "contract": RTINFER_CONTRACT,
         "ready": ready,
         "provider": "rtinferd",
+        "auth_source": auth_source,
         "tiers": ["realtime_structured", "realtime_thread_structured", "responses_structured", "responses_text"],
     }))
     .into_response()
@@ -1301,7 +1334,75 @@ async fn rtinfer_health(State(_state): State<Arc<AppState>>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use axum::body::to_bytes;
     use axum::http::StatusCode;
+    use rtinfer_core::{CodexAuth, CodexAuthSource, RealtimeError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct HealthAuthSource {
+        calls: AtomicUsize,
+        succeeds: bool,
+    }
+
+    #[async_trait]
+    impl CodexAuthSource for HealthAuthSource {
+        async fn load(&self) -> Result<CodexAuth, RealtimeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.succeeds {
+                return Err(RealtimeError::Refresh("provider unavailable".into()));
+            }
+            Ok(CodexAuth {
+                access_token: "provider-access".into(),
+                account_id: "acct".into(),
+                id_token: "provider-id".into(),
+                refresh_token: String::new(),
+                source_path: None,
+            })
+        }
+
+        async fn force_refresh(
+            &self,
+            _rejected_access_token: &str,
+        ) -> Result<CodexAuth, RealtimeError> {
+            self.load().await
+        }
+    }
+
+    async fn health_json(state: Arc<AppState>) -> Value {
+        let response = rtinfer_health(State(state)).await;
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn provider_source_is_shared_by_all_pools_and_health() {
+        let source = Arc::new(HealthAuthSource {
+            calls: AtomicUsize::new(0),
+            succeeds: true,
+        });
+        let shared: SharedCodexAuthSource = source.clone();
+
+        let state = AppState::new_with_auth_source(shared);
+
+        // Caller + warm pool + responses pool + thread registry + health field.
+        assert_eq!(Arc::strong_count(&source), 5);
+        let health = health_json(state).await;
+        assert_eq!(health["ready"], true);
+        assert_eq!(health["auth_source"], "cse-toold");
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_health_failure_is_not_masked_by_file_auth() {
+        let source: SharedCodexAuthSource = Arc::new(HealthAuthSource {
+            calls: AtomicUsize::new(0),
+            succeeds: false,
+        });
+        let health = health_json(AppState::new_with_auth_source(source)).await;
+        assert_eq!(health["ready"], false);
+        assert_eq!(health["auth_source"], "cse-toold");
+    }
 
     #[test]
     fn router_registers_both_routes() {

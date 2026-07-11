@@ -51,13 +51,13 @@ pub struct CodexAuth {
     pub account_id: String,
     /// Short-lived OpenID token (1-hour life). The codex/responses WS gates
     /// on this; an expired `id_token` is the real cause of handshake 403s.
-    /// Empty when auth was seeded from the daemon keychain (access-token only).
+    /// Empty only for access-token-only sources.
     pub id_token: String,
     /// Long-lived refresh token used to mint a new token set. Rotated on every
-    /// successful refresh. Empty when seeded from keychain.
+    /// successful refresh. Empty for externally refreshed sources.
     pub refresh_token: String,
     /// Source `auth.json` path, when loaded from a file. Refreshed tokens are
-    /// written back here. `None` for keychain-seeded auth (no write-back).
+    /// written back here. `None` for non-file auth (no write-back).
     pub source_path: Option<PathBuf>,
 }
 
@@ -244,11 +244,8 @@ impl CodexAuth {
 /// [`load`](CodexAuthSource::load) when their cache is cold/stale and
 /// [`force_refresh`](CodexAuthSource::force_refresh) after a handshake
 /// rejection. The standalone/dev path uses [`FileCodexAuthSource`]
-/// (`auth.json` + client-side OAuth rotation); the daemon supplies a
-/// keychain-backed source that re-mints through okta-aio and never writes
-/// `auth.json`, so the two refresh owners (the worker's server-side
-/// `refresh_token` and this client's) can never rotate the same token and
-/// invalidate each other.
+/// (`auth.json` + client-side OAuth rotation); the daemon can supply a
+/// cse-toold credential-process source that never writes `auth.json`.
 #[async_trait]
 pub trait CodexAuthSource: Send + Sync + 'static {
     /// Return currently-valid auth, refreshing/re-minting upstream if the
@@ -256,14 +253,19 @@ pub trait CodexAuthSource: Send + Sync + 'static {
     async fn load(&self) -> Result<CodexAuth, RealtimeError>;
     /// Force an upstream refresh/re-mint, bypassing any "still fresh" check.
     /// Called after the WS rejects a seemingly-fresh token at the handshake.
-    async fn force_refresh(&self) -> Result<CodexAuth, RealtimeError>;
+    ///
+    /// `rejected_access_token` is the access token that just failed (or empty
+    /// when the caller has no prior generation). Implementations use it to
+    /// collapse concurrent force calls and to avoid a redundant rotation when
+    /// another writer already replaced the rejected token.
+    async fn force_refresh(&self, rejected_access_token: &str) -> Result<CodexAuth, RealtimeError>;
 }
 
 /// Reads [`CodexAuth`] from an `auth.json` file (explicit path or the default
 /// `~/.codex/auth.json`) and performs the client-side OAuth `refresh_token`
 /// rotation when the `id_token` is stale. This is the standalone/dev/test
-/// path. The daemon's keychain source uses this as its fallback when keychain
-/// holds no codex tokens (operator ran `codex login` but never worker-enrolled).
+/// path. Daemon credential-process mode supplies a different source and never
+/// falls back here.
 pub struct FileCodexAuthSource {
     path: Option<PathBuf>,
 }
@@ -293,8 +295,14 @@ impl CodexAuthSource for FileCodexAuthSource {
         }
     }
 
-    async fn force_refresh(&self) -> Result<CodexAuth, RealtimeError> {
+    async fn force_refresh(&self, rejected_access_token: &str) -> Result<CodexAuth, RealtimeError> {
         let base = self.read()?;
+        // Another writer (or a concurrent force) may already have rotated the
+        // file. Re-read and skip our own refresh when the rejected token is no
+        // longer current — rotating again would invalidate the newer grant.
+        if !rejected_access_token.is_empty() && base.access_token != rejected_access_token {
+            return Ok(base);
+        }
         if base.can_refresh() {
             base.refresh().await
         } else {
@@ -304,7 +312,7 @@ impl CodexAuthSource for FileCodexAuthSource {
 }
 
 /// A fixed [`CodexAuth`] that never refreshes. Tests seed a pool's source with
-/// this so it neither reads `auth.json` nor touches keychain.
+/// this so it never reads or refreshes `auth.json`.
 pub struct StaticCodexAuthSource(pub CodexAuth);
 
 #[async_trait]
@@ -313,7 +321,10 @@ impl CodexAuthSource for StaticCodexAuthSource {
         Ok(self.0.clone())
     }
 
-    async fn force_refresh(&self) -> Result<CodexAuth, RealtimeError> {
+    async fn force_refresh(
+        &self,
+        _rejected_access_token: &str,
+    ) -> Result<CodexAuth, RealtimeError> {
         Ok(self.0.clone())
     }
 }
@@ -648,7 +659,7 @@ mod tests {
         let source = StaticCodexAuthSource(auth);
         assert_eq!(source.load().await.unwrap().access_token, "static-acc");
         assert_eq!(
-            source.force_refresh().await.unwrap().access_token,
+            source.force_refresh("").await.unwrap().access_token,
             "static-acc"
         );
     }
@@ -692,5 +703,22 @@ mod tests {
         assert_eq!(auth.access_token, "stale-acc");
         assert!(auth.needs_refresh(120));
         assert!(!auth.can_refresh());
+    }
+
+    #[tokio::test]
+    async fn file_force_rereads_and_reuses_newer_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let id = jwt_with_exp(now_unix() + 3600);
+        let raw = format!(
+            r#"{{"tokens":{{"access_token":"new-access","id_token":"{id}","refresh_token":"do-not-rotate","account_id":"acct"}}}}"#
+        );
+        std::fs::write(&path, &raw).unwrap();
+        let source = FileCodexAuthSource::new(Some(path.clone()));
+
+        let auth = source.force_refresh("rejected-old-access").await.unwrap();
+
+        assert_eq!(auth.access_token, "new-access");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
     }
 }

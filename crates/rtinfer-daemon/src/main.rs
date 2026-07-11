@@ -1,5 +1,6 @@
 //! rtinferd: always-on loopback rtinfer/1 inference daemon.
 
+mod cse_toold_auth;
 mod endpoint_file;
 mod install;
 mod lock;
@@ -7,6 +8,7 @@ mod self_update;
 mod server;
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 /// Default loopback port. rtinfer owns its own port (cse-toold cockpit keeps
 /// 8787); clients discover the live port through `~/.cse-rtinfer/endpoint.json`.
@@ -31,6 +33,9 @@ enum Cmd {
     Serve {
         #[arg(long, env = "RTINFER_PORT", default_value_t = DEFAULT_PORT)]
         port: u16,
+        /// Absolute cse-toold binary used as the Codex credential process.
+        #[arg(long, env = "RTINFER_CSE_TOOLD_BIN", value_name = "ABSOLUTE_PATH")]
+        cse_toold_bin: Option<PathBuf>,
     },
     /// Install + load the always-on LaunchAgent (macOS).
     Install {
@@ -54,7 +59,10 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Serve { port } => server::serve(port).await,
+        Cmd::Serve {
+            port,
+            cse_toold_bin,
+        } => server::serve(port, cse_toold_bin).await,
         Cmd::Install { port } => install::run_install(port),
         Cmd::Uninstall => install::run_uninstall(),
         Cmd::Status => {
@@ -70,5 +78,54 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn serve_accepts_explicit_cse_toold_bin() {
+        let cli = Cli::try_parse_from([
+            "rtinferd",
+            "serve",
+            "--port",
+            "9876",
+            "--cse-toold-bin",
+            "/opt/cse/bin/cse-toold",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::Serve {
+                port,
+                cse_toold_bin,
+            } => {
+                assert_eq!(port, 9876);
+                assert_eq!(
+                    cse_toold_bin.as_deref(),
+                    Some(std::path::Path::new("/opt/cse/bin/cse-toold"))
+                );
+            }
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_cse_toold_bin_declares_environment_source() {
+        let command = Cli::command();
+        let serve = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "serve")
+            .unwrap();
+        let argument = serve
+            .get_arguments()
+            .find(|argument| argument.get_id() == "cse_toold_bin")
+            .unwrap();
+        assert_eq!(
+            argument.get_env(),
+            Some(std::ffi::OsStr::new("RTINFER_CSE_TOOLD_BIN"))
+        );
     }
 }

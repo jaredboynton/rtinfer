@@ -11,9 +11,9 @@
 //! `npm` absent) the install falls back to the current executable path so a
 //! hand-run install still works; that path is simply not self-update-stable.
 //!
-//! Unlike cse-toold there is no keychain / TCC dependency here: the daemon
-//! only opens loopback sockets and reads `~/.codex/auth.json`, so no codesign
-//! pinning is required.
+//! rtinfer itself has no keychain / TCC dependency. File auth reads
+//! `~/.codex/auth.json`; credential-process mode delegates auth to an explicit
+//! cse-toold binary. rtinfer needs no codesign pinning.
 
 #[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
