@@ -676,6 +676,13 @@ impl AuthLoader {
             }
         }
         let auth = match self.auth_source.as_ref() {
+            Some(source) if force => {
+                let rejected = guard
+                    .as_ref()
+                    .map(|a| a.access_token.clone())
+                    .unwrap_or_default();
+                source.force_refresh(&rejected).await?
+            }
             Some(source) => source.load().await?,
             None => CodexAuth::from_default_path()?,
         };
@@ -932,6 +939,59 @@ mod tests {
     use std::sync::{LazyLock, Mutex as StdMutex};
 
     static ENV_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+    struct RecordingAuthSource {
+        rejected: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::CodexAuthSource for RecordingAuthSource {
+        async fn load(&self) -> Result<CodexAuth, RealtimeError> {
+            Ok(test_auth("loaded-access"))
+        }
+
+        async fn force_refresh(
+            &self,
+            rejected_access_token: &str,
+        ) -> Result<CodexAuth, RealtimeError> {
+            self.rejected
+                .lock()
+                .unwrap()
+                .push(rejected_access_token.to_string());
+            Ok(test_auth("forced-access"))
+        }
+    }
+
+    fn test_auth(access_token: &str) -> CodexAuth {
+        CodexAuth {
+            access_token: access_token.into(),
+            account_id: "acct".into(),
+            id_token: String::new(),
+            refresh_token: String::new(),
+            source_path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_loader_force_passes_cached_rejected_access() {
+        let source = Arc::new(RecordingAuthSource {
+            rejected: StdMutex::new(Vec::new()),
+        });
+        let loader = AuthLoader::new(Some(source.clone()));
+
+        assert_eq!(
+            loader.load(false).await.unwrap().access_token,
+            "loaded-access"
+        );
+        assert_eq!(
+            loader.load(true).await.unwrap().access_token,
+            "forced-access"
+        );
+        assert_eq!(
+            source.rejected.lock().unwrap().as_slice(),
+            ["loaded-access"]
+        );
+    }
 
     #[test]
     fn frame_is_out_of_band_with_forced_tool_and_question() {

@@ -1209,11 +1209,13 @@ name = "rtinfer-daemon"
 version = "0.1.9"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "rtinfer-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

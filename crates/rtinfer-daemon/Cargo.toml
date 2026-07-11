@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 rtinfer-core = { path = "../rtinfer-core" }
+async-trait = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
@@ -23,3 +24,4 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "test-util"] }
+tempfile = "3"
