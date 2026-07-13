@@ -1,7 +1,7 @@
 //! codex/responses transport — free gpt-5.4 over Codex OAuth.
 //!
 //! Distinct from [`crate::RealtimePool`]: the realtime API
-//! (`gpt-realtime-2`) and the codex/responses API speak different wire
+//! (`gpt-realtime-2.1`) and the codex/responses API speak different wire
 //! grammars (realtime: `session.update` + `conversation.item.create` +
 //! `response.create{output_modalities}`; responses: a single
 //! `response.create` with `model` + `instructions` + `input` +

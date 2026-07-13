@@ -18,9 +18,9 @@
         "user": "...",
         "schema_name": "result",
         "schema": { "type": "object", "properties": {} },
-        "model": "gpt-realtime-2"
+        "model": "gpt-realtime-2.1"
       },
-      "response_ok": { "contract": "rtinfer/1", "ok": true, "tier": "realtime_structured", "object": {}, "model": "gpt-realtime-2" }
+      "response_ok": { "contract": "rtinfer/1", "ok": true, "tier": "realtime_structured", "object": {}, "model": "gpt-realtime-2.1" }
     },
     "realtime_thread_structured": {
       "request": {
@@ -32,7 +32,7 @@
         "schema_name": "result",
         "schema": { "type": "object", "properties": {} },
         "items": [{ "id": "sha1-prefix-or-stable-id", "text": "..." }],
-        "model": "gpt-realtime-2",
+        "model": "gpt-realtime-2.1",
         "reasoning_effort": "low"
       },
       "response_ok": {
@@ -40,7 +40,7 @@
         "ok": true,
         "tier": "realtime_thread_structured",
         "object": {},
-        "model": "gpt-realtime-2",
+        "model": "gpt-realtime-2.1",
         "thread": { "appended": 3, "replayed": false, "total_items": 17 },
         "usage": { "total_tokens": 0, "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0 }
       }

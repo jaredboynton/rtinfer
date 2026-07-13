@@ -1,4 +1,4 @@
-//! Manual-only smoke test against the real `gpt-realtime-2` endpoint.
+//! Manual-only smoke test against the real `gpt-realtime-2.1` endpoint.
 //!
 //! Skipped by default (`#[ignore]`).  Run explicitly with:
 //!

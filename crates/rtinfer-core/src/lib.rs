@@ -1,4 +1,4 @@
-//! Realtime client for OpenAI's `gpt-realtime-2` WebSocket API.
+//! Realtime client for OpenAI's `gpt-realtime-2.1` WebSocket API.
 //!
 //! Streams a system `instructions` block, one or more `input_text` context
 //! blobs, then a single `QUESTION:` user message, and reads
@@ -51,10 +51,10 @@ pub use thread::{ThreadAskOutcome, ThreadItem, ThreadRegistry};
 pub use warm::{WarmSessionPool, WarmToolTurn};
 
 /// Default Realtime endpoint; identical to the JS reference.
-pub const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2";
+pub const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1";
 
 /// Default model.  Currently the only model we ever ask for.
-pub const DEFAULT_MODEL: &str = "gpt-realtime-2";
+pub const DEFAULT_MODEL: &str = "gpt-realtime-2.1";
 
 /// Default WebSocket handshake timeout.  Matches the JS client.
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -277,7 +277,7 @@ impl RealtimeError {
 
 /// Realtime client.  Holds a [`CodexAuth`] and dispatches one ask at a
 /// time over a fresh WebSocket — there is no connection pooling on
-/// this type because the underlying `gpt-realtime-2` session is
+/// this type because the underlying `gpt-realtime-2.1` session is
 /// request-scoped on the server side.
 ///
 /// **Direct construction is gated.** New callers outside
@@ -489,4 +489,15 @@ pub fn default_auth_path() -> Option<PathBuf> {
 /// used in error reporting.
 fn display_path(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_MODEL, REALTIME_URL};
+
+    #[test]
+    fn default_realtime_endpoint_uses_the_2_1_model() {
+        assert_eq!(DEFAULT_MODEL, "gpt-realtime-2.1");
+        assert!(REALTIME_URL.ends_with("model=gpt-realtime-2.1"));
+    }
 }

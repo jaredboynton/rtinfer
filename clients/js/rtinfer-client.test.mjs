@@ -99,3 +99,15 @@ test("unreachable daemon throws DaemonUnreachable", async () => {
     name: "DaemonUnreachable",
   });
 });
+
+test("defaults realtime scoring to gpt-realtime-2.1", async () => {
+  const previous = process.env.EXPLORE_SEARCH_SCORER_MODEL;
+  delete process.env.EXPLORE_SEARCH_SCORER_MODEL;
+  try {
+    const c = await freshClient("http://127.0.0.1:1");
+    assert.equal(c.scorerModel(), "gpt-realtime-2.1");
+  } finally {
+    if (previous === undefined) delete process.env.EXPLORE_SEARCH_SCORER_MODEL;
+    else process.env.EXPLORE_SEARCH_SCORER_MODEL = previous;
+  }
+});
