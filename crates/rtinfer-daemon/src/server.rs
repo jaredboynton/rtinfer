@@ -35,11 +35,11 @@ pub const RTINFER_CONTRACT: &str = "rtinfer/1";
 const OPENAI_REALTIME_MODELS: &[&str] = &[
     "gpt-realtime",
     "gpt-realtime-1.5",
-    "gpt-realtime-2",
-    "gpt-realtime-mini",
+    "gpt-realtime-2.1",
+    "gpt-realtime-2.1-mini",
 ];
 const REALTIME_REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high"];
-const REASONING_MODEL: &str = "gpt-realtime-2";
+const REASONING_MODEL: &str = "gpt-realtime-2.1";
 
 /// Warm Realtime sockets kept per model. The realtime fan-out (navigators +
 /// scorer) issues a handful of concurrent asks; 4 independent warm sessions per
@@ -1441,7 +1441,7 @@ mod tests {
     #[test]
     fn openai_request_parses_reasoning_from_all_supported_shapes() {
         let nested: OpenAiChatRequest = serde_json::from_value(json!({
-            "model": "gpt-realtime-2",
+            "model": "gpt-realtime-2.1",
             "messages": [{"role": "user", "content": "hi"}],
             "reasoning": {"effort": "medium"}
         }))
@@ -1452,7 +1452,7 @@ mod tests {
         );
 
         let snake: OpenAiChatRequest = serde_json::from_value(json!({
-            "model": "gpt-realtime-2",
+            "model": "gpt-realtime-2.1",
             "messages": [{"role": "user", "content": "hi"}],
             "reasoning_effort": "low"
         }))
@@ -1463,7 +1463,7 @@ mod tests {
         );
 
         let camel: OpenAiChatRequest = serde_json::from_value(json!({
-            "model": "gpt-realtime-2",
+            "model": "gpt-realtime-2.1",
             "messages": [{"role": "user", "content": "hi"}],
             "reasoningEffort": "high"
         }))
@@ -1480,15 +1480,24 @@ mod tests {
     }
 
     #[test]
+    fn realtime_model_catalog_uses_the_2_1_family() {
+        assert!(OPENAI_REALTIME_MODELS.contains(&"gpt-realtime-2.1"));
+        assert!(OPENAI_REALTIME_MODELS.contains(&"gpt-realtime-2.1-mini"));
+        assert!(!OPENAI_REALTIME_MODELS.contains(&"gpt-realtime-2"));
+        assert!(!OPENAI_REALTIME_MODELS.contains(&"gpt-realtime-mini"));
+        assert_eq!(REASONING_MODEL, "gpt-realtime-2.1");
+    }
+
+    #[test]
     fn reasoning_is_rejected_for_non_reasoning_models() {
         let req: OpenAiChatRequest = serde_json::from_value(json!({
-            "model": "gpt-realtime-mini",
+            "model": "gpt-realtime-2.1-mini",
             "messages": [{"role": "user", "content": "hi"}],
             "reasoning": {"effort": "low"}
         }))
         .unwrap();
         let err = request_reasoning_effort(&req).unwrap_err();
-        assert!(err.contains("only supported for gpt-realtime-2"));
+        assert!(err.contains("only supported for gpt-realtime-2.1"));
     }
 
     #[test]
@@ -1703,7 +1712,7 @@ mod tests {
         assert_eq!(calls[0]["function"]["name"], "get_weather");
         assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"SF\"}");
         // Builder returns a 200 with the tool_calls choice.
-        let resp = openai_chat_tool_response("gpt-realtime-2", &turn);
+        let resp = openai_chat_tool_response("gpt-realtime-2.1", &turn);
         assert_eq!(resp.status(), StatusCode::OK);
     }
 

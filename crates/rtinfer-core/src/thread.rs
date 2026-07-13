@@ -564,7 +564,13 @@ mod tests {
         );
         assert_ne!(
             base,
-            config_hash("sys", "result", &schema, Some("gpt-realtime-mini"), None)
+            config_hash(
+                "sys",
+                "result",
+                &schema,
+                Some("gpt-realtime-2.1-mini"),
+                None
+            )
         );
         assert_ne!(
             base,

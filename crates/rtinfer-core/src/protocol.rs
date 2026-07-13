@@ -1,6 +1,6 @@
 //! WebSocket session driver.
 //!
-//! Connects to `wss://api.openai.com/v1/realtime?model=gpt-realtime-2`
+//! Connects to `wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1`
 //! (or test override), runs the four-step handshake from the JS
 //! reference, then assembles `response.output_text.delta` into a single
 //! string until `response.done`.
@@ -269,7 +269,7 @@ pub async fn run_session_structured(
 ) -> Result<Value, RealtimeError> {
     // The realtime model is carried in the endpoint's `model=` query param,
     // not in any wire frame. A per-request `model` override therefore rewrites
-    // that param so one pool can serve gpt-realtime-mini and gpt-realtime-2.
+    // that param so one pool can serve gpt-realtime-2.1-mini and gpt-realtime-2.1.
     let endpoint = endpoint_for_model(endpoint, req.model.as_deref());
     let (mut ws, t0, _connected_ms) =
         open_realtime_session(auth, &endpoint, req.handshake_timeout).await?;
@@ -669,8 +669,8 @@ pub(crate) fn install_rustls_provider() {
 /// Rewrite the `model=` query parameter of a realtime WebSocket endpoint.
 ///
 /// The realtime API selects the model via the URL query string, so a
-/// per-request model override (e.g. `gpt-realtime-mini` for navigators vs
-/// `gpt-realtime-2` for scoring) is applied here. `None`, an empty string, or
+/// per-request model override (e.g. `gpt-realtime-2.1-mini` for navigators vs
+/// `gpt-realtime-2.1` for scoring) is applied here. `None`, an empty string, or
 /// a model equal to the existing param leaves the endpoint untouched. Any
 /// existing `model` param is replaced; other params are preserved in order.
 pub(crate) fn endpoint_for_model(endpoint: &str, model: Option<&str>) -> String {
@@ -806,12 +806,12 @@ mod tests {
     #[test]
     fn endpoint_for_model_replaces_existing_param() {
         let got = endpoint_for_model(
-            "wss://api.openai.com/v1/realtime?model=gpt-realtime-2",
-            Some("gpt-realtime-mini"),
+            "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1",
+            Some("gpt-realtime-2.1-mini"),
         );
         assert_eq!(
             got,
-            "wss://api.openai.com/v1/realtime?model=gpt-realtime-mini"
+            "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1-mini"
         );
     }
 
@@ -819,29 +819,29 @@ mod tests {
     fn endpoint_for_model_appends_when_absent() {
         let got = endpoint_for_model(
             "wss://api.openai.com/v1/realtime",
-            Some("gpt-realtime-mini"),
+            Some("gpt-realtime-2.1-mini"),
         );
         assert_eq!(
             got,
-            "wss://api.openai.com/v1/realtime?model=gpt-realtime-mini"
+            "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1-mini"
         );
     }
 
     #[test]
     fn endpoint_for_model_preserves_other_params() {
         let got = endpoint_for_model(
-            "wss://api.openai.com/v1/realtime?foo=1&model=gpt-realtime-2&bar=2",
-            Some("gpt-realtime-mini"),
+            "wss://api.openai.com/v1/realtime?foo=1&model=gpt-realtime-2.1&bar=2",
+            Some("gpt-realtime-2.1-mini"),
         );
         assert_eq!(
             got,
-            "wss://api.openai.com/v1/realtime?foo=1&model=gpt-realtime-mini&bar=2"
+            "wss://api.openai.com/v1/realtime?foo=1&model=gpt-realtime-2.1-mini&bar=2"
         );
     }
 
     #[test]
     fn endpoint_for_model_noop_on_none_or_empty() {
-        let base = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2";
+        let base = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1";
         assert_eq!(endpoint_for_model(base, None), base);
         assert_eq!(endpoint_for_model(base, Some("   ")), base);
     }

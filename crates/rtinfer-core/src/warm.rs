@@ -11,7 +11,7 @@
 //! The fix, proven in unifable's Python judge daemon: hold the socket OPEN and run
 //! each ask as an OUT-OF-BAND response (`response.create` with
 //! `"conversation":"none"`) carrying its own per-request `instructions` + `tools` +
-//! `input`. The session prefix stays on one connection (maximising gpt-realtime-2
+//! `input`. The session prefix stays on one connection (maximising gpt-realtime-2.1
 //! prompt-cache stickiness) and there is no per-call handshake.
 //!
 //! # Concurrency model
@@ -1064,8 +1064,8 @@ mod tests {
         let pool = WarmSessionPool::new_with_config(4, true, 1);
         // Sequential picks (each released before the next) must return the SAME
         // socket: an idle one is reused rather than opening a cold connection.
-        let a = pool.pick(Some("gpt-realtime-2"), "SYS").await;
-        let b = pool.pick(Some("gpt-realtime-2"), "SYS").await;
+        let a = pool.pick(Some("gpt-realtime-2.1"), "SYS").await;
+        let b = pool.pick(Some("gpt-realtime-2.1"), "SYS").await;
         assert!(
             Arc::ptr_eq(&a, &b),
             "idle socket must be reused, not multiplied"
@@ -1076,17 +1076,17 @@ mod tests {
     async fn pick_grows_ring_only_under_concurrency() {
         let pool = WarmSessionPool::new_with_config(2, true, 1);
         // Simulate an in-flight ask pinning the first socket.
-        let a = pool.pick(Some("gpt-realtime-2"), "SYS").await;
+        let a = pool.pick(Some("gpt-realtime-2.1"), "SYS").await;
         a.load.fetch_add(1, Ordering::Relaxed);
         // Same family + sticky busy -> overflow grows the ring (no re-pin).
-        let b = pool.pick(Some("gpt-realtime-2"), "SYS").await;
+        let b = pool.pick(Some("gpt-realtime-2.1"), "SYS").await;
         assert!(
             !Arc::ptr_eq(&a, &b),
             "busy sticky forces an overflow socket"
         );
         b.load.fetch_add(1, Ordering::Relaxed);
         // Ring full and both busy -> route to least-loaded (here, a tie on a).
-        let c = pool.pick(Some("gpt-realtime-2"), "SYS").await;
+        let c = pool.pick(Some("gpt-realtime-2.1"), "SYS").await;
         assert!(
             Arc::ptr_eq(&a, &c) || Arc::ptr_eq(&b, &c),
             "full busy ring routes to an existing least-loaded socket"
@@ -1096,12 +1096,12 @@ mod tests {
     #[tokio::test]
     async fn pick_keys_sessions_per_model() {
         let pool = WarmSessionPool::new_with_config(1, true, 1);
-        let mini = pool.pick(Some("gpt-realtime-mini"), "SYS").await;
-        let full = pool.pick(Some("gpt-realtime-2"), "SYS").await;
+        let mini = pool.pick(Some("gpt-realtime-2.1-mini"), "SYS").await;
+        let full = pool.pick(Some("gpt-realtime-2.1"), "SYS").await;
         // Different models get independent rings (and endpoints).
         assert!(!Arc::ptr_eq(&mini, &full));
-        assert!(mini.endpoint.contains("gpt-realtime-mini"));
-        assert!(full.endpoint.contains("gpt-realtime-2"));
+        assert!(mini.endpoint.contains("gpt-realtime-2.1-mini"));
+        assert!(full.endpoint.contains("gpt-realtime-2.1"));
     }
 
     #[tokio::test]
@@ -1112,24 +1112,24 @@ mod tests {
         // seen), but once a family is pinned it sticks to that session even
         // after other activity grows the ring.
         let pool = WarmSessionPool::new_with_config(3, true, 1);
-        let fa = pool.pick(Some("gpt-realtime-2"), "GRADE").await;
+        let fa = pool.pick(Some("gpt-realtime-2.1"), "GRADE").await;
         // Grow the ring by holding fa busy so a different family cold-pins to a
         // new session, then release fa.
         fa.load.fetch_add(1, Ordering::Relaxed);
-        let fb = pool.pick(Some("gpt-realtime-2"), "GROUNDED").await;
+        let fb = pool.pick(Some("gpt-realtime-2.1"), "GROUNDED").await;
         assert!(
             !Arc::ptr_eq(&fa, &fb),
             "distinct families under load get distinct sessions"
         );
         fa.load.fetch_sub(1, Ordering::Relaxed);
         // The first family sticks to its original pinned session (cache hit).
-        let fa2 = pool.pick(Some("gpt-realtime-2"), "GRADE").await;
+        let fa2 = pool.pick(Some("gpt-realtime-2.1"), "GRADE").await;
         assert!(
             Arc::ptr_eq(&fa, &fa2),
             "same family must stick to its pinned cache home"
         );
         // The second family sticks to its own pinned session, not fa's.
-        let fb2 = pool.pick(Some("gpt-realtime-2"), "GROUNDED").await;
+        let fb2 = pool.pick(Some("gpt-realtime-2.1"), "GROUNDED").await;
         assert!(
             Arc::ptr_eq(&fb, &fb2),
             "second family sticks to its own cache home"
@@ -1142,10 +1142,10 @@ mod tests {
         // next same-family ask overflows to another session WITHOUT re-pinning:
         // after the sticky session drains, the next serial call sticks back.
         let pool = WarmSessionPool::new_with_config(3, true, 1);
-        let fa = pool.pick(Some("gpt-realtime-2"), "ARM").await;
+        let fa = pool.pick(Some("gpt-realtime-2.1"), "ARM").await;
         fa.load.fetch_add(1, Ordering::Relaxed); // simulate in-flight
                                                  // Overflow: same family, but sticky is busy -> a different session.
-        let over = pool.pick(Some("gpt-realtime-2"), "ARM").await;
+        let over = pool.pick(Some("gpt-realtime-2.1"), "ARM").await;
         assert!(
             !Arc::ptr_eq(&fa, &over),
             "busy sticky overflows to another session"
@@ -1153,7 +1153,7 @@ mod tests {
         // Drain the sticky session.
         fa.load.fetch_sub(1, Ordering::Relaxed);
         // Next serial same-family call sticks back to the original cache home.
-        let fa2 = pool.pick(Some("gpt-realtime-2"), "ARM").await;
+        let fa2 = pool.pick(Some("gpt-realtime-2.1"), "ARM").await;
         assert!(
             Arc::ptr_eq(&fa, &fa2),
             "overflow must not re-pin; sticky home survives a burst"
@@ -1163,18 +1163,18 @@ mod tests {
     #[tokio::test]
     async fn pick_dead_sticky_repins_to_another_ring_session() {
         let pool = WarmSessionPool::new_with_config(3, true, 1);
-        let dead = pool.pick(Some("gpt-realtime-2"), "ZONE").await;
+        let dead = pool.pick(Some("gpt-realtime-2.1"), "ZONE").await;
         dead.load.fetch_add(1, Ordering::Relaxed);
-        let replacement = pool.pick(Some("gpt-realtime-2"), "OTHER").await;
+        let replacement = pool.pick(Some("gpt-realtime-2.1"), "OTHER").await;
         dead.load.fetch_sub(1, Ordering::Relaxed);
         dead.sticky_repin_needed.store(true, Ordering::Relaxed);
-        let fa2 = pool.pick(Some("gpt-realtime-2"), "ZONE").await;
+        let fa2 = pool.pick(Some("gpt-realtime-2.1"), "ZONE").await;
         assert!(
             Arc::ptr_eq(&replacement, &fa2),
             "dead sticky must re-pin to the best surviving session in the ring"
         );
         // The new pin is live: a follow-up sticks to it.
-        let fa3 = pool.pick(Some("gpt-realtime-2"), "ZONE").await;
+        let fa3 = pool.pick(Some("gpt-realtime-2.1"), "ZONE").await;
         assert!(
             Arc::ptr_eq(&fa2, &fa3),
             "repinned session is the new sticky cache home"
@@ -1188,8 +1188,8 @@ mod tests {
         // recorded. Uses the per-pool constructor so parallel tests do not race
         // on the global env var.
         let pool = WarmSessionPool::new_with_config(2, false, 1);
-        let a = pool.pick(Some("gpt-realtime-2"), "GRADE").await;
-        let b = pool.pick(Some("gpt-realtime-2"), "GROUNDED").await;
+        let a = pool.pick(Some("gpt-realtime-2.1"), "GRADE").await;
+        let b = pool.pick(Some("gpt-realtime-2.1"), "GROUNDED").await;
         // With sticky off and both idle, both families land on the SAME idle
         // session (the pre-sticky idle-reuse behavior).
         assert!(
@@ -1205,15 +1205,15 @@ mod tests {
     #[tokio::test]
     async fn pick_honors_configured_sticky_overflow_threshold() {
         let pool = WarmSessionPool::new_with_config(2, true, 2);
-        let sticky = pool.pick(Some("gpt-realtime-2"), "SYS").await;
+        let sticky = pool.pick(Some("gpt-realtime-2.1"), "SYS").await;
         sticky.load.fetch_add(1, Ordering::Relaxed);
-        let same = pool.pick(Some("gpt-realtime-2"), "SYS").await;
+        let same = pool.pick(Some("gpt-realtime-2.1"), "SYS").await;
         assert!(
             Arc::ptr_eq(&sticky, &same),
             "load below the configured overflow threshold should still stick"
         );
         sticky.load.fetch_add(1, Ordering::Relaxed);
-        let overflow = pool.pick(Some("gpt-realtime-2"), "SYS").await;
+        let overflow = pool.pick(Some("gpt-realtime-2.1"), "SYS").await;
         assert!(
             !Arc::ptr_eq(&sticky, &overflow),
             "load at the configured overflow threshold should overflow"

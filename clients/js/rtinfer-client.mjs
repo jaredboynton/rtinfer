@@ -29,7 +29,7 @@ const CONTRACT_MAJOR = 1;
 const WELL_KNOWN = path.join(os.homedir(), ".cse-rtinfer", "endpoint.json");
 const LEGACY_COCKPIT_DEFAULT = "http://127.0.0.1:8787";
 const POOL_SIZE = Math.max(1, parseInt(process.env.EXPLORE_SEARCH_DAEMON_POOL || "4", 10));
-const SCORER_MODEL = (process.env.EXPLORE_SEARCH_SCORER_MODEL || "gpt-realtime-2").trim();
+const SCORER_MODEL = (process.env.EXPLORE_SEARCH_SCORER_MODEL || "gpt-realtime-2.1").trim();
 const HEALTH_TIMEOUT_MS = Math.round(
   (parseFloat(process.env.EXPLORE_SEARCH_DAEMON_CONNECT || "") || 0.5) * 1000,
 );

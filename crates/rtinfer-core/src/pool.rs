@@ -2,7 +2,7 @@
 //!
 //! # Why a "pool" when sessions are request-scoped
 //!
-//! OpenAI's `gpt-realtime-2` WebSocket session is request-scoped on the
+//! OpenAI's `gpt-realtime-2.1` WebSocket session is request-scoped on the
 //! server side: each `ask()` / `ask_with_tools()` must own its own
 //! WebSocket from `session.update` through `response.done`. That means
 //! we cannot reuse a WebSocket across asks — the abstraction below is
@@ -287,7 +287,7 @@ impl RealtimePool {
         protocol::run_session_with_tools(&auth, &self.endpoint, req, executor).await
     }
 
-    /// One structured ask over gpt-realtime-2: the (strict-normalised)
+    /// One structured ask over gpt-realtime-2.1: the (strict-normalised)
     /// schema rides a single forced function tool and that call's
     /// arguments are the result. The signature mirrors
     /// `CodexResponsesPool::ask_structured` so call sites swap pools
@@ -305,7 +305,7 @@ impl RealtimePool {
     }
 
     /// Like [`RealtimePool::ask_structured`] but selects the realtime model
-    /// per call (e.g. `gpt-realtime-mini` for navigators, `gpt-realtime-2`
+    /// per call (e.g. `gpt-realtime-2.1-mini` for navigators, `gpt-realtime-2.1`
     /// for scoring). `None` uses the pool's configured endpoint model. The
     /// model rewrites the endpoint's `model=` query param inside
     /// `run_session_structured`, so one pool serves both tiers.
