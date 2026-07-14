@@ -1,6 +1,6 @@
 {
   "name": "@jaredboynton/rtinfer",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "Always-on loopback rtinfer/1 inference daemon (gpt-realtime + codex/responses over Codex OAuth). Shared by cse-tools and unifable.",
   "license": "MIT",
   "repository": {
@@ -23,8 +23,8 @@
     "postinstall": "node src/postinstall.js"
   },
   "optionalDependencies": {
-    "@jaredboynton/rtinfer-darwin-arm64": "0.1.11",
-    "@jaredboynton/rtinfer-linux-arm64": "0.1.11",
-    "@jaredboynton/rtinfer-linux-x64": "0.1.11"
+    "@jaredboynton/rtinfer-darwin-arm64": "0.1.12",
+    "@jaredboynton/rtinfer-linux-arm64": "0.1.12",
+    "@jaredboynton/rtinfer-linux-x64": "0.1.12"
   }
 }
