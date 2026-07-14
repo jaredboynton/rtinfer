@@ -108,6 +108,27 @@ fn sticky_routing_enabled_at_build() -> bool {
 /// Wall-clock ceiling for one out-of-band structured ask on a warm socket.
 const ASK_WALL_CLOCK: Duration = Duration::from_secs(180);
 
+/// Idle ceiling for REUSING a warm socket. The provider closes idle realtime
+/// sockets long before the 60-minute session cap, and a half-closed socket is
+/// only discovered after a dispatch fails. Reconnecting proactively past this
+/// idle age converts that failure mode into one cheap handshake.
+const SESSION_IDLE_MAX: Duration = Duration::from_secs(75);
+
+/// True for errors that mean the REUSED socket was already dead or died under
+/// us before the ask produced anything server-side: safe to re-dispatch the
+/// identical ask once on a fresh socket. Provider errors (the model actually
+/// rejected the request) and wall-clock timeouts are NOT stale-socket errors.
+fn is_stale_socket_error(e: &RealtimeError) -> bool {
+    match e {
+        RealtimeError::Protocol(m) => {
+            m.contains("socket closed mid-ask")
+                || m.starts_with("ws send:")
+                || m.starts_with("ws read:")
+        }
+        _ => false,
+    }
+}
+
 /// One persistent Realtime socket bound to a single model endpoint. The mutex
 /// serializes the one in-flight out-of-band response this socket carries.
 struct WarmSession {
@@ -125,6 +146,11 @@ struct WarmSession {
 struct LiveSocket {
     ws: protocol::RealtimeWs,
     opened_at: Instant,
+    /// Completion time of the last successful ask. A reused socket idle past
+    /// [`SESSION_IDLE_MAX`] is treated as suspect (providers close idle
+    /// realtime sockets well before the 60-minute cap) and proactively
+    /// reconnected instead of paying a doomed dispatch.
+    last_used: Instant,
 }
 
 impl WarmSession {
@@ -178,65 +204,60 @@ impl WarmSession {
         let mut guard = self.inner.lock().await;
 
         // Connect (with one auth-refresh retry on a rejected handshake).
-        let need_connect = guard
-            .as_ref()
-            .map(|s| s.opened_at.elapsed() >= SESSION_MAX_AGE)
-            .unwrap_or(true);
-        if need_connect {
-            if let Some(old) = guard.take() {
-                let mut ws = old.ws;
-                let _ = protocol::graceful_close(&mut ws).await;
-            }
-            let auth = match auth_loader.load(false).await {
-                Ok(auth) => auth,
-                Err(e) => {
-                    self.sticky_repin_needed.store(true, Ordering::Relaxed);
-                    return Err(e);
-                }
-            };
-            match self.connect_and_prime(&auth).await {
-                Ok(live) => *guard = Some(live),
-                Err(e) if crate::responses::is_auth_handshake_error(&e) => {
-                    debug!(error = %e, "warm: auth rejected at handshake; refreshing + one retry");
-                    let auth2 = match auth_loader.load(true).await {
-                        Ok(auth) => auth,
-                        Err(e) => {
-                            self.sticky_repin_needed.store(true, Ordering::Relaxed);
-                            return Err(e);
-                        }
-                    };
-                    match self.connect_and_prime(&auth2).await {
-                        Ok(live) => *guard = Some(live),
-                        Err(e) => {
-                            self.sticky_repin_needed.store(true, Ordering::Relaxed);
-                            return Err(e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.sticky_repin_needed.store(true, Ordering::Relaxed);
-                    return Err(e);
-                }
-            }
-        }
+        let fresh = self.ensure_live(&mut guard, auth_loader).await?;
 
         let live = guard
             .as_mut()
             .ok_or_else(|| RealtimeError::Protocol("warm: no live socket after connect".into()))?;
 
-        // Dispatch the out-of-band response and read it to completion. On any
-        // socket error, drop the session so the next ask reconnects.
+        // Dispatch the out-of-band response and read it to completion. A REUSED
+        // socket may have been half-closed by the provider while idle, which
+        // only surfaces once the dispatch fails; that ask never started
+        // server-side, so reconnect and re-dispatch it ONCE on a fresh socket
+        // (the caller sees one request -> one result). Any other error drops
+        // the session so the next ask reconnects.
         match Self::run_one(
             &mut live.ws,
             system,
             user,
             schema_name,
-            schema,
+            schema.clone(),
             reasoning_effort,
         )
         .await
         {
-            Ok(v) => Ok(v),
+            Ok(v) => {
+                live.last_used = Instant::now();
+                Ok(v)
+            }
+            Err(e) if !fresh && is_stale_socket_error(&e) => {
+                debug!(error = %e, "warm: reused socket was stale; reconnect + one re-dispatch");
+                *guard = None;
+                self.ensure_live(&mut guard, auth_loader).await?;
+                let live = guard.as_mut().ok_or_else(|| {
+                    RealtimeError::Protocol("warm: no live socket after reconnect".into())
+                })?;
+                match Self::run_one(
+                    &mut live.ws,
+                    system,
+                    user,
+                    schema_name,
+                    schema,
+                    reasoning_effort,
+                )
+                .await
+                {
+                    Ok(v) => {
+                        live.last_used = Instant::now();
+                        Ok(v)
+                    }
+                    Err(e) => {
+                        *guard = None;
+                        self.sticky_repin_needed.store(true, Ordering::Relaxed);
+                        Err(e)
+                    }
+                }
+            }
             Err(e) => {
                 *guard = None;
                 self.sticky_repin_needed.store(true, Ordering::Relaxed);
@@ -257,54 +278,36 @@ impl WarmSession {
     ) -> Result<String, RealtimeError> {
         let mut guard = self.inner.lock().await;
 
-        let need_connect = guard
-            .as_ref()
-            .map(|s| s.opened_at.elapsed() >= SESSION_MAX_AGE)
-            .unwrap_or(true);
-        if need_connect {
-            if let Some(old) = guard.take() {
-                let mut ws = old.ws;
-                let _ = protocol::graceful_close(&mut ws).await;
-            }
-            let auth = match auth_loader.load(false).await {
-                Ok(auth) => auth,
-                Err(e) => {
-                    self.sticky_repin_needed.store(true, Ordering::Relaxed);
-                    return Err(e);
-                }
-            };
-            match self.connect_and_prime(&auth).await {
-                Ok(live) => *guard = Some(live),
-                Err(e) if crate::responses::is_auth_handshake_error(&e) => {
-                    debug!(error = %e, "warm: auth rejected at handshake; refreshing + one retry");
-                    let auth2 = match auth_loader.load(true).await {
-                        Ok(auth) => auth,
-                        Err(e) => {
-                            self.sticky_repin_needed.store(true, Ordering::Relaxed);
-                            return Err(e);
-                        }
-                    };
-                    match self.connect_and_prime(&auth2).await {
-                        Ok(live) => *guard = Some(live),
-                        Err(e) => {
-                            self.sticky_repin_needed.store(true, Ordering::Relaxed);
-                            return Err(e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.sticky_repin_needed.store(true, Ordering::Relaxed);
-                    return Err(e);
-                }
-            }
-        }
+        let fresh = self.ensure_live(&mut guard, auth_loader).await?;
 
         let live = guard
             .as_mut()
             .ok_or_else(|| RealtimeError::Protocol("warm: no live socket after connect".into()))?;
 
         match Self::run_text(&mut live.ws, system, user, reasoning_effort).await {
-            Ok(v) => Ok(v),
+            Ok(v) => {
+                live.last_used = Instant::now();
+                Ok(v)
+            }
+            Err(e) if !fresh && is_stale_socket_error(&e) => {
+                debug!(error = %e, "warm: reused socket was stale; reconnect + one re-dispatch");
+                *guard = None;
+                self.ensure_live(&mut guard, auth_loader).await?;
+                let live = guard.as_mut().ok_or_else(|| {
+                    RealtimeError::Protocol("warm: no live socket after reconnect".into())
+                })?;
+                match Self::run_text(&mut live.ws, system, user, reasoning_effort).await {
+                    Ok(v) => {
+                        live.last_used = Instant::now();
+                        Ok(v)
+                    }
+                    Err(e) => {
+                        *guard = None;
+                        self.sticky_repin_needed.store(true, Ordering::Relaxed);
+                        Err(e)
+                    }
+                }
+            }
             Err(e) => {
                 *guard = None;
                 self.sticky_repin_needed.store(true, Ordering::Relaxed);
@@ -327,47 +330,7 @@ impl WarmSession {
     ) -> Result<WarmToolTurn, RealtimeError> {
         let mut guard = self.inner.lock().await;
 
-        let need_connect = guard
-            .as_ref()
-            .map(|s| s.opened_at.elapsed() >= SESSION_MAX_AGE)
-            .unwrap_or(true);
-        if need_connect {
-            if let Some(old) = guard.take() {
-                let mut ws = old.ws;
-                let _ = protocol::graceful_close(&mut ws).await;
-            }
-            let auth = match auth_loader.load(false).await {
-                Ok(auth) => auth,
-                Err(e) => {
-                    self.sticky_repin_needed.store(true, Ordering::Relaxed);
-                    return Err(e);
-                }
-            };
-            match self.connect_and_prime(&auth).await {
-                Ok(live) => *guard = Some(live),
-                Err(e) if crate::responses::is_auth_handshake_error(&e) => {
-                    debug!(error = %e, "warm: auth rejected at handshake; refreshing + one retry");
-                    let auth2 = match auth_loader.load(true).await {
-                        Ok(auth) => auth,
-                        Err(e) => {
-                            self.sticky_repin_needed.store(true, Ordering::Relaxed);
-                            return Err(e);
-                        }
-                    };
-                    match self.connect_and_prime(&auth2).await {
-                        Ok(live) => *guard = Some(live),
-                        Err(e) => {
-                            self.sticky_repin_needed.store(true, Ordering::Relaxed);
-                            return Err(e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.sticky_repin_needed.store(true, Ordering::Relaxed);
-                    return Err(e);
-                }
-            }
-        }
+        let fresh = self.ensure_live(&mut guard, auth_loader).await?;
 
         let live = guard
             .as_mut()
@@ -383,13 +346,103 @@ impl WarmSession {
         )
         .await
         {
-            Ok(v) => Ok(v),
+            Ok(v) => {
+                live.last_used = Instant::now();
+                Ok(v)
+            }
+            Err(e) if !fresh && is_stale_socket_error(&e) => {
+                debug!(error = %e, "warm: reused socket was stale; reconnect + one re-dispatch");
+                *guard = None;
+                self.ensure_live(&mut guard, auth_loader).await?;
+                let live = guard.as_mut().ok_or_else(|| {
+                    RealtimeError::Protocol("warm: no live socket after reconnect".into())
+                })?;
+                match Self::run_tools(
+                    &mut live.ws,
+                    system,
+                    input_items,
+                    tools,
+                    tool_choice,
+                    reasoning_effort,
+                )
+                .await
+                {
+                    Ok(v) => {
+                        live.last_used = Instant::now();
+                        Ok(v)
+                    }
+                    Err(e) => {
+                        *guard = None;
+                        self.sticky_repin_needed.store(true, Ordering::Relaxed);
+                        Err(e)
+                    }
+                }
+            }
             Err(e) => {
                 *guard = None;
                 self.sticky_repin_needed.store(true, Ordering::Relaxed);
                 Err(e)
             }
         }
+    }
+
+    /// Ensure `guard` holds a live socket the caller may dispatch on:
+    /// (re)connect + prime when there is no socket, the socket exceeded the
+    /// 50-minute session cap, or it sat idle past [`SESSION_IDLE_MAX`].
+    /// Returns true when the socket was freshly (re)connected by THIS call —
+    /// a fresh socket that still fails dispatch is a real error, not a stale
+    /// reuse, so the caller must not re-dispatch on it.
+    async fn ensure_live(
+        &self,
+        guard: &mut tokio::sync::MutexGuard<'_, Option<LiveSocket>>,
+        auth_loader: &AuthLoader,
+    ) -> Result<bool, RealtimeError> {
+        let need_connect = guard
+            .as_ref()
+            .map(|s| {
+                s.opened_at.elapsed() >= SESSION_MAX_AGE
+                    || s.last_used.elapsed() >= SESSION_IDLE_MAX
+            })
+            .unwrap_or(true);
+        if !need_connect {
+            return Ok(false);
+        }
+        if let Some(old) = guard.take() {
+            let mut ws = old.ws;
+            let _ = protocol::graceful_close(&mut ws).await;
+        }
+        let auth = match auth_loader.load(false).await {
+            Ok(auth) => auth,
+            Err(e) => {
+                self.sticky_repin_needed.store(true, Ordering::Relaxed);
+                return Err(e);
+            }
+        };
+        match self.connect_and_prime(&auth).await {
+            Ok(live) => **guard = Some(live),
+            Err(e) if crate::responses::is_auth_handshake_error(&e) => {
+                debug!(error = %e, "warm: auth rejected at handshake; refreshing + one retry");
+                let auth2 = match auth_loader.load(true).await {
+                    Ok(auth) => auth,
+                    Err(e) => {
+                        self.sticky_repin_needed.store(true, Ordering::Relaxed);
+                        return Err(e);
+                    }
+                };
+                match self.connect_and_prime(&auth2).await {
+                    Ok(live) => **guard = Some(live),
+                    Err(e) => {
+                        self.sticky_repin_needed.store(true, Ordering::Relaxed);
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) => {
+                self.sticky_repin_needed.store(true, Ordering::Relaxed);
+                return Err(e);
+            }
+        }
+        Ok(true)
     }
 
     async fn connect_and_prime(&self, auth: &CodexAuth) -> Result<LiveSocket, RealtimeError> {
@@ -401,6 +454,7 @@ impl WarmSession {
         Ok(LiveSocket {
             ws,
             opened_at: Instant::now(),
+            last_used: Instant::now(),
         })
     }
 
