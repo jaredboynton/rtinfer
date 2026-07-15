@@ -60,12 +60,29 @@ pub struct AppState {
     auth_source: Option<SharedCodexAuthSource>,
 }
 
+/// Optional daemon-side responses-pool capacity override. The core default
+/// (16) protects casual callers; heavy pipelines (jsp-evidence fan-out) raise
+/// it explicitly via RTINFER_RESPONSES_CAPACITY. 0 = unbounded.
+fn responses_capacity_from_env() -> Option<usize> {
+    std::env::var("RTINFER_RESPONSES_CAPACITY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+}
+
+fn responses_pool_builder() -> rtinfer_core::CodexResponsesPoolBuilder {
+    let mut b = CodexResponsesPool::builder();
+    if let Some(cap) = responses_capacity_from_env() {
+        b = b.capacity(cap);
+    }
+    b
+}
+
 impl AppState {
     /// Build the default file-auth pools (both read `~/.codex/auth.json`).
     pub fn new_file_auth() -> Arc<Self> {
         Arc::new(Self {
             warm_realtime: WarmSessionPool::new(WARM_SESSIONS_PER_MODEL, None),
-            codex_responses_pool: CodexResponsesPool::builder().build(),
+            codex_responses_pool: responses_pool_builder().build(),
             realtime_threads: ThreadRegistry::new(None),
             auth_source: None,
         })
@@ -81,9 +98,7 @@ impl AppState {
     fn new_with_auth_source(source: SharedCodexAuthSource) -> Arc<Self> {
         Arc::new(Self {
             warm_realtime: WarmSessionPool::new(WARM_SESSIONS_PER_MODEL, Some(source.clone())),
-            codex_responses_pool: CodexResponsesPool::builder()
-                .auth_source(source.clone())
-                .build(),
+            codex_responses_pool: responses_pool_builder().auth_source(source.clone()).build(),
             realtime_threads: ThreadRegistry::new(Some(source.clone())),
             auth_source: Some(source),
         })
@@ -110,13 +125,28 @@ pub async fn serve(port: u16, cse_toold_bin: Option<PathBuf>) -> anyhow::Result<
         Some(bin) => AppState::new_cse_toold(bin)?,
         None => AppState::new_file_auth(),
     };
-    let app = router(state);
+    let app = router(state.clone());
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     let base_url = format!("http://127.0.0.1:{}", bound.port());
     crate::endpoint_file::write(&base_url)?;
     info!(%base_url, version = crate::self_update::current_version(), "rtinfer: serving");
+
+    // Background prewarm: park warm codex/responses sockets in the idle pool so
+    // heavy fan-out (jsp-evidence) never pays cold-start handshakes. Off by
+    // default; RTINFER_RESPONSES_PREWARM=<n> enables it.
+    if let Some(n) = std::env::var("RTINFER_RESPONSES_PREWARM")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        let pool = state.codex_responses_pool.clone();
+        tokio::spawn(async move {
+            pool.prewarm(n).await;
+            tracing::info!(sockets = n, "rtinfer: responses prewarm pass complete");
+        });
+    }
 
     // Background self-update: drains the server on a confirmed newer release.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -729,13 +759,17 @@ fn openai_chat_tool_stream_response(model: &str, turn: &WarmToolTurn) -> Respons
 fn rtinfer_map_realtime_err(tier: &str, err: rtinfer_core::RealtimeError) -> Response {
     use rtinfer_core::RealtimeError as RE;
     let (status, code, retryable) = match &err {
+        // Handshake 401/403 after the pool's internal refresh-and-retry loop is
+        // the edge's rolling handshake rate limit, not a credential outage.
+        // Marking it retryable stops clients from latching a global auth
+        // freeze that fails every in-flight account for 30s.
         RE::Handshake(msg)
             if msg.contains("401")
                 || msg.contains("403")
                 || msg.contains("Unauthorized")
                 || msg.contains("Forbidden") =>
         {
-            (StatusCode::UNAUTHORIZED, "auth_unavailable", false)
+            (StatusCode::BAD_GATEWAY, "provider_error", true)
         }
         RE::AuthFile { .. } | RE::AuthMissing(_) | RE::AuthMalformed(_) | RE::Refresh(_) => {
             (StatusCode::UNAUTHORIZED, "auth_unavailable", false)

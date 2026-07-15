@@ -34,14 +34,14 @@ use std::time::{Duration, Instant};
 use futures::{SinkExt, StreamExt};
 use http::Request;
 use serde_json::{json, Value};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::net::TcpStream;
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, tungstenite::http::Uri};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, trace};
 
 use crate::auth::{CodexAuth, SharedCodexAuthSource, ID_TOKEN_REFRESH_MARGIN_SECS};
@@ -65,6 +65,24 @@ pub const CODEX_RESPONSES_BETA: &str = "responses_websockets=2026-02-06";
 
 /// Reuse the realtime pool's TTL semantics.
 pub use crate::DEFAULT_AUTH_TTL;
+
+/// A connected codex/responses WebSocket, reusable across sequential asks.
+type ResponsesSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Maximum simultaneous fresh TLS+WS handshakes to the codex/responses edge.
+/// The edge 403-rejects large concurrent handshake bursts (observed at ~40+),
+/// while accepting any number of asks on ALREADY-OPEN sockets. Gating only the
+/// handshake staggers cold starts without limiting warm throughput.
+const HANDSHAKE_GATE_PERMITS: usize = 8;
+static HANDSHAKE_GATE: Semaphore = Semaphore::const_new(HANDSHAKE_GATE_PERMITS);
+
+/// Cheap jitter source (no rand dependency): sub-millisecond clock entropy.
+fn rand_like_jitter() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+}
 
 const UNBOUNDED_CAPACITY: usize = 1 << 31;
 const DEFAULT_CAPACITY: usize = 16;
@@ -282,6 +300,7 @@ impl CodexResponsesPoolBuilder {
             auth_path: self.auth_path,
             auth_source: self.auth_source,
             cached_auth: RwLock::new(cached),
+            idle_sockets: Mutex::new(Vec::new()),
         })
     }
 }
@@ -302,6 +321,12 @@ pub struct CodexResponsesPool {
     auth_path: Option<PathBuf>,
     auth_source: Option<SharedCodexAuthSource>,
     cached_auth: RwLock<Option<CachedAuth>>,
+    /// Warm sockets checked back in after a clean ask. Each socket carries an
+    /// exclusive request/response conversation, so a socket is EITHER idle in
+    /// this pool OR owned by exactly one in-flight ask. Reuse eliminates the
+    /// per-ask TLS+WS handshake (the dominant cost of small asks and the
+    /// trigger of upstream 401/403 handshake rate-limiting under fan-out).
+    idle_sockets: Mutex<Vec<ResponsesSocket>>,
 }
 
 impl CodexResponsesPool {
@@ -351,18 +376,7 @@ impl CodexResponsesPool {
             model = %self.model,
             "codex/responses: dispatch ask_structured"
         );
-        let text = match run_responses_session(&auth, &self.endpoint, &frame).await {
-            Ok(t) => t,
-            // Reactive safety net: the server rejected the (seemingly fresh)
-            // token at the handshake. Force a refresh of the rotated tokens and
-            // retry exactly once.
-            Err(e) if is_auth_handshake_error(&e) => {
-                debug!(error = %e, "codex/responses: auth rejected at handshake; forcing token refresh + one retry");
-                let auth2 = self.force_refresh_after(&auth.access_token).await?;
-                run_responses_session(&auth2, &self.endpoint, &frame).await?
-            }
-            Err(e) => return Err(e),
-        };
+        let text = self.run_warm(&auth, &frame).await?;
         serde_json::from_str::<Value>(&text).map_err(|e| {
             RealtimeError::Protocol(format!("codex/responses output is not valid json: {e}"))
         })
@@ -391,15 +405,128 @@ impl CodexResponsesPool {
             model = %model,
             "codex/responses: dispatch ask_text"
         );
-        match run_responses_session(&auth, &self.endpoint, &frame).await {
-            Ok(t) => Ok(t),
-            Err(e) if is_auth_handshake_error(&e) => {
-                debug!(error = %e, "codex/responses: auth rejected at handshake; forcing token refresh + one retry");
-                let auth2 = self.force_refresh_after(&auth.access_token).await?;
-                run_responses_session(&auth2, &self.endpoint, &frame).await
+        self.run_warm(&auth, &frame).await
+    }
+
+    /// Run one request frame over a warm socket when available, else a fresh
+    /// connection. A socket that survives a full ask cleanly is checked back
+    /// in for the next ask; any transport error drops the socket and the ask
+    /// retries ONCE on a brand-new connection (which also re-handles the
+    /// auth-rejected-handshake refresh path). Warm reuse removes the per-ask
+    /// TLS+WS handshake that upstream rate-limits under fan-out.
+    async fn run_warm(&self, auth: &CodexAuth, frame: &Value) -> Result<String, RealtimeError> {
+        if let Some(mut ws) = self.checkout_socket().await {
+            match run_on_socket(&mut ws, frame).await {
+                Ok(text) => {
+                    self.checkin_socket(ws).await;
+                    return Ok(text);
+                }
+                Err(e) => {
+                    // Stale/expired warm socket: drop it and fall through to a
+                    // fresh connection. Do NOT surface this error; the retry
+                    // below is authoritative.
+                    debug!(error = %e, "codex/responses: warm socket failed; reconnecting");
+                }
             }
-            Err(e) => Err(e),
         }
+        // Acquire a socket with a bounded retry loop. Two supplies race here:
+        // (a) warm sockets returned to the idle pool by completing asks, and
+        // (b) fresh handshakes. The edge 403-rejects handshake bursts under a
+        // rolling rate limit, so a 403 is NOT terminal: refresh auth once (the
+        // stale-token case), then back off with jitter and re-poll the idle
+        // pool before the next handshake attempt. Under fan-out this converges
+        // because every finishing ask donates its warm socket back to the pool.
+        let mut refreshed = false;
+        let mut auth_current = auth.clone();
+        let mut last_err: Option<RealtimeError> = None;
+        for attempt in 0u64..8 {
+            if attempt > 0 {
+                if let Some(mut ws) = self.checkout_socket().await {
+                    match run_on_socket(&mut ws, frame).await {
+                        Ok(text) => {
+                            self.checkin_socket(ws).await;
+                            return Ok(text);
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "codex/responses: warm socket failed in retry; dropping");
+                        }
+                    }
+                }
+            }
+            match connect_socket(&auth_current, &self.endpoint).await {
+                Ok(mut ws) => {
+                    return match run_on_socket(&mut ws, frame).await {
+                        Ok(text) => {
+                            self.checkin_socket(ws).await;
+                            Ok(text)
+                        }
+                        Err(e) => Err(e),
+                    };
+                }
+                Err(e) if is_auth_handshake_error(&e) => {
+                    debug!(error = %e, attempt, "codex/responses: handshake rejected; backoff + retry");
+                    if !refreshed {
+                        auth_current = self.force_refresh_after(&auth_current.access_token).await?;
+                        refreshed = true;
+                    }
+                    let backoff_ms = 300 * (attempt + 1) + (rand_like_jitter() % 700);
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| RealtimeError::Handshake("handshake retries exhausted".to_owned())))
+    }
+
+    /// Open `count` warm sockets in the background and park them in the idle
+    /// pool. Handshakes flow through the same gate as on-demand connects, so a
+    /// large prewarm staggers instead of bursting into the edge's rolling
+    /// handshake rate limit. Failures are logged and skipped; prewarm is a
+    /// best-effort latency optimisation, never a correctness dependency.
+    pub async fn prewarm(&self, count: usize) {
+        for _ in 0..count {
+            {
+                let idle = self.idle_sockets.lock().await;
+                if idle.len() >= count.min(self.capacity) {
+                    break;
+                }
+            }
+            let auth = match self.fresh_auth().await {
+                Ok(a) => a,
+                Err(e) => {
+                    debug!(error = %e, "codex/responses: prewarm auth unavailable; stopping");
+                    return;
+                }
+            };
+            match connect_socket(&auth, &self.endpoint).await {
+                Ok(ws) => self.checkin_socket(ws).await,
+                Err(e) => {
+                    // Rolling handshake limit: wait it out instead of hammering.
+                    debug!(error = %e, "codex/responses: prewarm handshake failed; backing off");
+                    tokio::time::sleep(Duration::from_millis(1_500 + (rand_like_jitter() % 3_000)))
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Take one idle warm socket, if any.
+    async fn checkout_socket(&self) -> Option<ResponsesSocket> {
+        self.idle_sockets.lock().await.pop()
+    }
+
+    /// Return a healthy socket to the idle pool, bounded by capacity.
+    async fn checkin_socket(&self, ws: ResponsesSocket) {
+        let mut idle = self.idle_sockets.lock().await;
+        // The edge rate-limits HANDSHAKES, not open sockets. Keeping a large
+        // idle pool is what lets heavy fan-out (hundreds of concurrent asks)
+        // run entirely on warm sockets after the first wave.
+        if idle.len() < self.capacity.min(512) {
+            idle.push(ws);
+        }
+        // else: drop the socket; the pool is already warm enough.
     }
 
     async fn fresh_auth(&self) -> Result<CodexAuth, RealtimeError> {
@@ -505,20 +632,32 @@ pub(crate) fn is_auth_handshake_error(e: &RealtimeError) -> bool {
     )
 }
 
-async fn run_responses_session(
+async fn connect_socket(
     auth: &CodexAuth,
     endpoint: &str,
-    request_frame: &Value,
-) -> Result<String, RealtimeError> {
+) -> Result<ResponsesSocket, RealtimeError> {
     install_rustls_provider();
+    let _handshake_permit = HANDSHAKE_GATE
+        .acquire()
+        .await
+        .map_err(|e| RealtimeError::Protocol(format!("handshake gate closed: {e}")))?;
     let client_request = build_responses_request(endpoint, auth)?;
     let connect_fut = connect_async(client_request);
-    let (mut ws, _resp) = match timeout(DEFAULT_HANDSHAKE_TIMEOUT, connect_fut).await {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => return Err(RealtimeError::Handshake(format!("{e}"))),
-        Err(_) => return Err(RealtimeError::Handshake("timeout".to_owned())),
-    };
+    match timeout(DEFAULT_HANDSHAKE_TIMEOUT, connect_fut).await {
+        Ok(Ok((ws, _resp))) => Ok(ws),
+        Ok(Err(e)) => Err(RealtimeError::Handshake(format!("{e}"))),
+        Err(_) => Err(RealtimeError::Handshake("timeout".to_owned())),
+    }
+}
 
+/// Send one request frame on an already-connected socket and assemble the
+/// streamed text. The socket is left OPEN on success so the caller can check
+/// it back into the warm pool; every error path leaves the socket to be
+/// dropped by the caller.
+async fn run_on_socket(
+    ws: &mut ResponsesSocket,
+    request_frame: &Value,
+) -> Result<String, RealtimeError> {
     let body = serde_json::to_string(request_frame)?;
     ws.send(Message::text(body))
         .await
@@ -563,17 +702,13 @@ async fn run_responses_session(
             Message::Ping(p) => {
                 let _ = ws.send(Message::Pong(p)).await;
             }
-            Message::Close(_) => break 'read,
+            Message::Close(_) => {
+                err = Some(RealtimeError::Protocol("socket closed mid-ask".to_owned()));
+                break 'read;
+            }
             _ => {}
         }
     }
-
-    let _ = ws
-        .send(Message::Close(Some(CloseFrame {
-            code: CloseCode::Normal,
-            reason: "done".into(),
-        })))
-        .await;
 
     if let Some(e) = err {
         return Err(e);
