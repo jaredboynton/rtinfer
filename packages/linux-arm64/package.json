@@ -1,6 +1,6 @@
 {
   "name": "@jaredboynton/rtinfer-linux-arm64",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "Linux arm64 binary for @jaredboynton/rtinfer",
   "license": "MIT",
   "repository": {
