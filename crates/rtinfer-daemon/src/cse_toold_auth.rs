@@ -24,6 +24,9 @@ pub const MIN_VALID_FOR_SECS: u64 = 300;
 // kill_on_drop still terminates this child if their request is cancelled.
 const CHILD_TIMEOUT: Duration = Duration::from_secs(7 * 60);
 const MAX_STDOUT_BYTES: usize = 64 * 1024;
+/// Bounded stderr capture for refusal classification (cse-toold caps its
+/// lease error line at 240 bytes; 4 KiB leaves margin without buffering risk).
+const MAX_STDERR_BYTES: usize = 4 * 1024;
 
 #[derive(Default)]
 struct ProviderState {
@@ -107,7 +110,7 @@ impl CseTooldCodexAuthSource {
             .arg(MIN_VALID_FOR_SECS.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         if let Some(lease_id) = rejected_lease {
             command.arg("--rejected-lease").arg(lease_id);
@@ -115,24 +118,49 @@ impl CseTooldCodexAuthSource {
 
         let mut child = command
             .spawn()
-            .map_err(|e| provider_error(format!("failed to spawn cse-toold codex-lease: {e}")))?;
+            .map_err(|e| transient_error(format!("failed to spawn cse-toold codex-lease: {e}")))?;
         let mut stdout = child
             .stdout
             .take()
-            .ok_or_else(|| provider_error("cse-toold codex-lease missing stdout pipe"))?;
+            .ok_or_else(|| transient_error("cse-toold codex-lease missing stdout pipe"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| transient_error("cse-toold codex-lease missing stderr pipe"))?;
+
+        // stderr is drained on an independent task (bounded) so a chatty
+        // child cannot deadlock on a full pipe, and an early stdout error
+        // never has to wait on it — the pipe closes when the child dies,
+        // which ends the task. cse-toold caps lease error text anyway.
+        let stderr_handle = tokio::spawn(async move {
+            let mut err_bytes = Vec::new();
+            let mut err_chunk = [0_u8; 1024];
+            loop {
+                match stderr.read(&mut err_chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        if err_bytes.len() < MAX_STDERR_BYTES {
+                            let take = read.min(MAX_STDERR_BYTES - err_bytes.len());
+                            err_bytes.extend_from_slice(&err_chunk[..take]);
+                        }
+                    }
+                }
+            }
+            err_bytes
+        });
 
         let collect = async {
             let mut bytes = Vec::new();
             let mut chunk = [0_u8; 4096];
             loop {
                 let read = stdout.read(&mut chunk).await.map_err(|e| {
-                    provider_error(format!("cse-toold codex-lease stdout read failed: {e}"))
+                    transient_error(format!("cse-toold codex-lease stdout read failed: {e}"))
                 })?;
                 if read == 0 {
                     break;
                 }
                 if bytes.len().saturating_add(read) > MAX_STDOUT_BYTES {
-                    return Err(provider_error(
+                    return Err(transient_error(
                         "cse-toold codex-lease stdout exceeded bound",
                     ));
                 }
@@ -141,7 +169,7 @@ impl CseTooldCodexAuthSource {
             let status = child
                 .wait()
                 .await
-                .map_err(|e| provider_error(format!("cse-toold codex-lease wait failed: {e}")))?;
+                .map_err(|e| transient_error(format!("cse-toold codex-lease wait failed: {e}")))?;
             Ok::<_, RealtimeError>((bytes, status))
         };
 
@@ -149,23 +177,45 @@ impl CseTooldCodexAuthSource {
             Ok(Ok(output)) => output,
             Ok(Err(error)) => {
                 kill_and_reap(&mut child).await;
+                stderr_handle.abort();
                 return Err(error);
             }
             Err(_) => {
                 kill_and_reap(&mut child).await;
-                return Err(provider_error("cse-toold codex-lease timed out"));
+                stderr_handle.abort();
+                return Err(transient_error("cse-toold codex-lease timed out"));
             }
         };
 
+        // Child has exited, so its stderr pipe is closed and the drain task
+        // is complete (or completes immediately); bound the wait defensively.
+        let err_bytes =
+            match tokio::time::timeout(std::time::Duration::from_secs(2), stderr_handle).await {
+                Ok(Ok(err_bytes)) => err_bytes,
+                _ => Vec::new(),
+            };
+
         if !status.success() {
-            return Err(provider_error(format!(
+            let stderr_text = String::from_utf8_lossy(&err_bytes);
+            // Positive credential refusal (cse-toold forwards invalid_grant /
+            // enrollment refusals on stderr) is the ONLY nonzero exit that
+            // deserves the non-retryable auth_unavailable mapping. Everything
+            // else is a lease-plane hiccup and must stay retryable.
+            if stderr_is_credential_refusal(&stderr_text) {
+                return Err(provider_error(format!(
+                    "cse-toold codex-lease refused the stored credential (exit {}): {}",
+                    status.code().unwrap_or(-1),
+                    stderr_text.chars().take(240).collect::<String>()
+                )));
+            }
+            return Err(transient_error(format!(
                 "cse-toold codex-lease exited nonzero ({})",
                 status.code().unwrap_or(-1)
             )));
         }
 
         let lease: LeaseResponse = serde_json::from_slice(&bytes)
-            .map_err(|_| provider_error("cse-toold codex-lease returned malformed v1 json"))?;
+            .map_err(|_| transient_error("cse-toold codex-lease returned malformed v1 json"))?;
         validate_lease(&lease)?;
         Ok(lease)
     }
@@ -229,6 +279,38 @@ fn now_unix() -> i64 {
 
 fn provider_error(message: impl Into<String>) -> RealtimeError {
     RealtimeError::Refresh(message.into())
+}
+
+/// Transient lease-plane failure: spawn/timeout/read errors, oversize or
+/// malformed output, or a nonzero exit whose stderr does NOT positively
+/// refuse the credential. Maps to `RealtimeError::Provider`, which the
+/// server surfaces as `provider_error retryable=true` — so a hiccup in the
+/// lease subprocess can no longer latch clients into the 30s global
+/// `auth_unavailable` freeze that a dead credential deserves.
+fn transient_error(message: impl Into<String>) -> RealtimeError {
+    RealtimeError::Provider {
+        code: "lease_transient".into(),
+        message: message.into(),
+    }
+}
+
+/// True when codex-lease stderr positively states the stored credential is
+/// dead (invalid_grant / unenrolled / refresh token rejected or revoked).
+/// Only these deserve the non-retryable `auth_unavailable` mapping; every
+/// other nonzero exit says nothing about the credential and must stay
+/// retryable. Mirrors cse-toold's own refusal taxonomy (its codex-lease CLI
+/// forwards `invalid_grant:`-prefixed refusal text from the grant tier).
+fn stderr_is_credential_refusal(stderr: &str) -> bool {
+    let t = stderr.to_ascii_lowercase();
+    if t.contains("invalid_grant")
+        || t.contains("not enrolled")
+        || t.contains("not-enrolled")
+        || t.contains("enrollment_required")
+    {
+        return true;
+    }
+    t.contains("refresh")
+        && (t.contains("rejected") || t.contains("revoked") || t.contains("refused"))
 }
 
 #[async_trait]
@@ -544,7 +626,7 @@ fi
     }
 
     #[tokio::test]
-    async fn nonzero_exit_discards_stderr() {
+    async fn nonzero_exit_without_refusal_is_transient_and_discards_stderr() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_executable(
             dir.path(),
@@ -555,10 +637,87 @@ fi
             .unwrap()
             .load()
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("nonzero (7)"));
-        assert!(!error.contains("access-secret"));
+            .unwrap_err();
+        // Regression (2026-07-15 incident): a lease-plane hiccup must NOT map
+        // to RealtimeError::Refresh — the server turns Refresh into
+        // auth_unavailable retryable=false, and clients latch a 30s global
+        // freeze across every in-flight account. Only a positive credential
+        // refusal deserves that.
+        assert!(
+            matches!(error, RealtimeError::Provider { .. }),
+            "non-refusal nonzero exit must be transient, got: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("nonzero (7)"));
+        assert!(!text.contains("access-secret"));
+    }
+
+    #[tokio::test]
+    async fn nonzero_exit_with_invalid_grant_stderr_is_auth_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_executable(
+            dir.path(),
+            "refused",
+            "#!/bin/sh\nprintf '%s' 'codex-lease: invalid_grant: file-origin codex refresh token refused' >&2\nexit 1\n",
+        );
+        let error = CseTooldCodexAuthSource::new(bin)
+            .unwrap()
+            .load()
+            .await
+            .unwrap_err();
+        // A positive refusal keeps today's non-retryable auth mapping: the
+        // credential is dead and hammering the lease plane cannot fix it.
+        assert!(
+            matches!(error, RealtimeError::Refresh(_)),
+            "credential refusal must stay an auth error, got: {error:?}"
+        );
+        assert!(error.to_string().contains("refused the stored credential"));
+    }
+
+    #[tokio::test]
+    async fn spawn_failure_and_timeout_are_transient() {
+        // Spawn failure: binary does not exist.
+        let error = CseTooldCodexAuthSource::new("/nonexistent/cse-toold-fake")
+            .unwrap()
+            .load()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RealtimeError::Provider { .. }));
+
+        // Timeout: child sleeps past the shortened budget.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_executable(dir.path(), "sleepy", "#!/bin/sh\nsleep 5\n");
+        let source = CseTooldCodexAuthSource::new(bin)
+            .unwrap()
+            .with_timeout(Duration::from_millis(200));
+        let error = source.load().await.unwrap_err();
+        assert!(
+            matches!(error, RealtimeError::Provider { .. }),
+            "timeout must be transient, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn refusal_classifier_matches_cse_toold_taxonomy_only() {
+        for refusal in [
+            "codex-lease: invalid_grant: refresh token refused",
+            "worker says enrollment_required",
+            "codex not enrolled for operator",
+            "refresh token rejected by worker",
+            "stored refresh revoked upstream",
+        ] {
+            assert!(stderr_is_credential_refusal(refusal), "{refusal}");
+        }
+        for transient in [
+            "",
+            "codex lease recovery failed",
+            "operator identity unavailable",
+            "keychain store locked",
+            "file-origin grant inconclusive: token endpoint POST: timeout",
+            "load shedding, try later",
+        ] {
+            assert!(!stderr_is_credential_refusal(transient), "{transient}");
+        }
     }
 
     #[test]
