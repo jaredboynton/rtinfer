@@ -62,6 +62,13 @@ as `codex-lease --min-valid-for-seconds 300`; health reports `ready:false` if
 the configured provider cannot return a valid v1 lease. Omit both settings to
 keep the default file-auth behavior.
 
+For the cse-toold lease provider, only positive credential refusal evidence —
+`invalid_grant`, unenrollment, or refresh-token rejection/revocation — maps to
+non-retryable `auth_unavailable`. Spawn, timeout, malformed lease output, and
+a nonzero lease command without that refusal evidence map to retryable
+`provider_error`; callers must not latch those lease-plane failures as dead
+credentials.
+
 ## Sticky Routing
 
 `realtime_structured` uses a warm-session pool with prompt-cache sticky routing:
