@@ -182,6 +182,51 @@ def ask_structured(
     return obj, None
 
 
+def ask_responses_structured(
+    system: str,
+    user: str,
+    schema: dict[str, Any],
+    *,
+    schema_name: str = "result",
+    model: str = "gpt-5.4",
+    reasoning_effort: str = "low",
+    timeout: float = REQUEST_TIMEOUT,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """One structured ask over the daemon's shared Responses pool."""
+    base = discover()
+    if base is None:
+        return None, None
+    body = {
+        "contract": CONTRACT,
+        "tier": "responses_structured",
+        "system": system,
+        "user": user,
+        "schema": schema,
+        "schema_name": schema_name,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+    }
+    payload = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        base + "/v1/infer",
+        data=payload,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (loopback only)
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        _invalidate()
+        return None, None
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        return None, None
+    obj = data.get("object")
+    if not isinstance(obj, dict):
+        return None, None
+    return obj, None
+
+
 def ask_thread_structured(
     thread_id: str,
     system: str,

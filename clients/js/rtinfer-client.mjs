@@ -184,6 +184,18 @@ export async function daemonAsk(namespace, req, { model = SCORER_MODEL } = {}) {
   });
 }
 
+// One structured Responses ask through the daemon's shared WebSocket pool.
+export async function daemonAskResponsesStructured(req, { model = "gpt-5.4" } = {}) {
+  return postInfer("responses_structured", {
+    system: req.system,
+    user: req.user,
+    schema: req.schema,
+    schema_name: req.schemaName || req.schema_name || "result",
+    model,
+    reasoning_effort: req.reasoningEffort,
+  });
+}
+
 // One structured thread ask (realtime_thread_structured): server-side pinned
 // conversation keyed by threadId. `items` is the FULL current transcript
 // window as { id, text } objects with client-stable ids; the daemon appends

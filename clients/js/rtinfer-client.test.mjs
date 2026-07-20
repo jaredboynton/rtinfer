@@ -66,6 +66,45 @@ test("discovers a ready daemon and posts responses_text", async () => {
   );
 });
 
+test("daemonAskResponsesStructured posts exact terra high envelope", async () => {
+  await withServer(
+    async (req, res) => {
+      if (req.url === "/v1/infer/health") {
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ contract: "rtinfer/1", ready: true }));
+        return;
+      }
+      const body = JSON.parse(await readBody(req));
+      assert.deepEqual(body, {
+        contract: "rtinfer/1",
+        tier: "responses_structured",
+        system: "judge",
+        user: "payload",
+        schema: { type: "object", properties: { choice_id: { type: "string" } } },
+        schema_name: "capsule_gate",
+        model: "gpt-5.6-terra",
+        reasoning_effort: "high",
+      });
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ contract: "rtinfer/1", ok: true, object: { choice_id: "a" } }));
+    },
+    async (base) => {
+      const c = await freshClient(base);
+      const out = await c.daemonAskResponsesStructured(
+        {
+          system: "judge",
+          user: "payload",
+          schema: { type: "object", properties: { choice_id: { type: "string" } } },
+          schemaName: "capsule_gate",
+          reasoningEffort: "high",
+        },
+        { model: "gpt-5.6-terra" },
+      );
+      assert.deepEqual(out, { choice_id: "a" });
+    },
+  );
+});
+
 test("ready:false is treated as not reachable", async () => {
   await withServer(
     (req, res) => {
