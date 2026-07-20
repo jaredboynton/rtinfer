@@ -105,6 +105,39 @@ test("daemonAskResponsesStructured posts exact terra high envelope", async () =>
   );
 });
 
+test("daemonAskResponsesStructuredDetailed preserves usage envelope", async () => {
+  await withServer(
+    async (req, res) => {
+      if (req.url === "/v1/infer/health") {
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({contract: "rtinfer/1", ready: true}));
+        return;
+      }
+      await readBody(req);
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          contract: "rtinfer/1",
+          ok: true,
+          object: {choice_id: "a"},
+          usage: {output_tokens: 7, output_tokens_details: {reasoning_tokens: 5}},
+        }),
+      );
+    },
+    async (base) => {
+      const c = await freshClient(base);
+      const out = await c.daemonAskResponsesStructuredDetailed(
+        {system: "judge", user: "payload", schema: {type: "object", properties: {}}},
+        {model: "gpt-5.6-terra"},
+      );
+      assert.deepEqual(out, {
+        object: {choice_id: "a"},
+        usage: {output_tokens: 7, output_tokens_details: {reasoning_tokens: 5}},
+      });
+    },
+  );
+});
+
 test("ready:false is treated as not reachable", async () => {
   await withServer(
     (req, res) => {

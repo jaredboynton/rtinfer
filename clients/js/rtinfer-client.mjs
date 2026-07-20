@@ -144,7 +144,7 @@ export async function warmDaemonPool() {
 // POST one rtinfer request. Throws DaemonUnreachable when no daemon is
 // reachable; returns null on a per-request error (so a single bad ask degrades
 // without aborting a batch). `tier` selects the model arm.
-export async function postInfer(tier, body) {
+export async function postInfer(tier, body, {returnEnvelope = false} = {}) {
   const base = await discoverEndpoint();
   if (!base) throw new DaemonUnreachable();
   const timeoutMs = tier === "responses_text" ? SYNTH_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
@@ -168,7 +168,8 @@ export async function postInfer(tier, body) {
     return null;
   }
   if (!resp.ok || !json || json.ok !== true) return null;
-  return tier === "responses_text" ? json.text : json.object;
+  if (tier === "responses_text") return json.text;
+  return returnEnvelope ? {object: json.object, usage: json.usage ?? null} : json.object;
 }
 
 // One structured realtime ask (navigator / scorer). Returns the parsed object
@@ -194,6 +195,23 @@ export async function daemonAskResponsesStructured(req, { model = "gpt-5.4" } = 
     model,
     reasoning_effort: req.reasoningEffort,
   });
+}
+
+// Structured Responses ask with provider usage retained for evaluation and
+// accounting callers. Normal product callers use the object-only helper above.
+export async function daemonAskResponsesStructuredDetailed(req, {model = "gpt-5.4"} = {}) {
+  return postInfer(
+    "responses_structured",
+    {
+      system: req.system,
+      user: req.user,
+      schema: req.schema,
+      schema_name: req.schemaName || req.schema_name || "result",
+      model,
+      reasoning_effort: req.reasoningEffort,
+    },
+    {returnEnvelope: true},
+  );
 }
 
 // One structured thread ask (realtime_thread_structured): server-side pinned
