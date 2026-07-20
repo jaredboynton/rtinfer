@@ -95,6 +95,11 @@ at release (`scripts/sync-clients.sh`) and symlink for local dev
 changes; the health gate accepts any `rtinfer/1.x` so a minor bump never
 dark-fails and a true `rtinfer/2` cleanly falls open.
 
+Per-request client wall clocks default to **300s** so saturated local fan-out
+does not abort while a healthy warm pool is still working. Override with
+`EXPLORE_SEARCH_DAEMON_REQUEST` / `EXPLORE_SEARCH_DAEMON_SYNTH_REQUEST` (JS)
+or `CSE_RTINFER_REQUEST_TIMEOUT` (Python).
+
 ## Develop
 
 ```sh

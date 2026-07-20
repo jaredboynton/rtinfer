@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod adaptive;
 mod auth;
 mod pool;
 mod protocol;
@@ -33,6 +34,11 @@ mod responses;
 mod thread;
 mod warm;
 
+pub use adaptive::{
+    AdaptiveConcurrency, AdaptiveConcurrencyConfig, AdaptiveConcurrencySnapshot, AdaptiveLease,
+    AdaptiveOutcome, AggregateConcurrencySnapshot, ConcurrencyLimits, EnabledResponsesLanes,
+    ResponsesTransportKind, TransportConcurrencySnapshot,
+};
 pub use auth::{
     CodexAuth, CodexAuthSource, FileCodexAuthSource, SharedCodexAuthSource, StaticCodexAuthSource,
     ID_TOKEN_REFRESH_MARGIN_SECS,
@@ -43,9 +49,14 @@ pub use pool::{
 };
 pub use protocol::{run_session, run_session_structured, run_session_with_tools};
 pub use responses::{
-    assemble_codex_responses_text, require_all_object_properties_for_strict_schema,
-    CodexResponsesPool, CodexResponsesPoolBuilder, CODEX_RESPONSES_BETA, CODEX_RESPONSES_MODEL,
-    CODEX_RESPONSES_ORIGINATOR, CODEX_RESPONSES_URL, CODEX_RESPONSES_USER_AGENT,
+    assemble_codex_responses_sse, assemble_codex_responses_text, classify_responses_http_status,
+    classify_responses_provider_code, require_all_object_properties_for_strict_schema,
+    responses_content_type_allows_sse, CodexRequestIds, CodexResponsesClient,
+    CodexResponsesClientBuilder, CodexResponsesPool, CodexResponsesPoolBuilder,
+    CodexResponsesWireRequest, ResponsesClientSnapshot, ResponsesResultClass,
+    ResponsesRuntimeConfig, ResponsesTransportMode, CODEX_BETA_FEATURES, CODEX_CLIENT_VERSION,
+    CODEX_RESPONSES_HTTP_URL, CODEX_RESPONSES_MODEL, CODEX_RESPONSES_ORIGINATOR,
+    CODEX_RESPONSES_URL, CODEX_RESPONSES_USER_AGENT,
 };
 pub use thread::{ThreadAskOutcome, ThreadItem, ThreadRegistry};
 pub use warm::{WarmSessionPool, WarmToolTurn};

@@ -1,7 +1,7 @@
 //! rtinfer/1 loopback inference server.
 //!
 //! Exposes the daemon's warm [`RealtimePool`] (gpt-realtime-* navigators /
-//! scorer) and [`CodexResponsesPool`] (gpt-5.x synthesis) over a loopback
+//! scorer) and [`CodexResponsesClient`] (gpt-5.x synthesis) over a loopback
 //! HTTP contract so any client on the machine (cse-sweep, unifable judge,
 //! ...) borrows one warm pool instead of spawning its own realtime daemon.
 //!
@@ -22,8 +22,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rtinfer_core::{
-    CodexResponsesPool, RealtimeTool, SharedCodexAuthSource, ThreadItem, ThreadRegistry,
-    WarmSessionPool, WarmToolTurn,
+    CodexResponsesClient, RealtimeTool, ResponsesRuntimeConfig, SharedCodexAuthSource, ThreadItem,
+    ThreadRegistry, TransportConcurrencySnapshot, WarmSessionPool, WarmToolTurn,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -46,12 +46,16 @@ const REASONING_MODEL: &str = "gpt-realtime-2.1";
 /// model give real parallelism without cid-multiplexing one socket.
 const WARM_SESSIONS_PER_MODEL: usize = 4;
 
-/// Shared daemon state: the warm realtime sessions + the responses pool.
+/// Shared daemon state: the warm realtime sessions + the responses coordinator.
 pub struct AppState {
     /// Warm persistent Realtime sockets (out-of-band asks, no per-call
     /// handshake). The realtime_structured tier dispatches here.
     pub warm_realtime: Arc<WarmSessionPool>,
-    pub codex_responses_pool: Arc<CodexResponsesPool>,
+    /// Single Responses coordinator (WSS / HTTP / dual). Only
+    /// `responses_structured` and `responses_text` route here.
+    pub codex_responses_client: Arc<CodexResponsesClient>,
+    /// Validated `RTINFER_RESPONSES_PREWARM` from the one-shot runtime parse.
+    responses_prewarm: usize,
     /// Per-thread pinned sockets with server-side append-only conversations.
     /// The realtime_thread_structured tier dispatches here.
     pub realtime_threads: Arc<ThreadRegistry>,
@@ -60,48 +64,53 @@ pub struct AppState {
     auth_source: Option<SharedCodexAuthSource>,
 }
 
-/// Optional daemon-side responses-pool capacity override. The core default
-/// (16) protects casual callers; heavy pipelines (jsp-evidence fan-out) raise
-/// it explicitly via RTINFER_RESPONSES_CAPACITY. 0 = unbounded.
-fn responses_capacity_from_env() -> Option<usize> {
-    std::env::var("RTINFER_RESPONSES_CAPACITY")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-}
-
-fn responses_pool_builder() -> rtinfer_core::CodexResponsesPoolBuilder {
-    let mut b = CodexResponsesPool::builder();
-    if let Some(cap) = responses_capacity_from_env() {
-        b = b.capacity(cap);
+/// Parse runtime config once and build the shared Responses coordinator.
+fn build_codex_responses_client(
+    auth_source: Option<SharedCodexAuthSource>,
+) -> Result<(Arc<CodexResponsesClient>, usize), rtinfer_core::RealtimeError> {
+    let runtime = ResponsesRuntimeConfig::from_env()?;
+    let prewarm = runtime.prewarm;
+    let mut builder = CodexResponsesClient::builder().runtime(runtime);
+    if let Some(source) = auth_source {
+        builder = builder.auth_source(source);
     }
-    b
+    Ok((builder.build()?, prewarm))
 }
 
 impl AppState {
     /// Build the default file-auth pools (both read `~/.codex/auth.json`).
-    pub fn new_file_auth() -> Arc<Self> {
-        Arc::new(Self {
+    ///
+    /// Invalid Responses runtime configuration fails before the daemon binds.
+    pub fn new_file_auth() -> Result<Arc<Self>, rtinfer_core::RealtimeError> {
+        let (codex_responses_client, responses_prewarm) = build_codex_responses_client(None)?;
+        Ok(Arc::new(Self {
             warm_realtime: WarmSessionPool::new(WARM_SESSIONS_PER_MODEL, None),
-            codex_responses_pool: responses_pool_builder().build(),
+            codex_responses_client,
+            responses_prewarm,
             realtime_threads: ThreadRegistry::new(None),
             auth_source: None,
-        })
+        }))
     }
 
     /// Build all pools around one shared credential-process source.
     pub fn new_cse_toold(bin: PathBuf) -> Result<Arc<Self>, rtinfer_core::RealtimeError> {
         let source: SharedCodexAuthSource =
             crate::cse_toold_auth::CseTooldCodexAuthSource::shared(bin)?;
-        Ok(Self::new_with_auth_source(source))
+        Self::new_with_auth_source(source)
     }
 
-    fn new_with_auth_source(source: SharedCodexAuthSource) -> Arc<Self> {
-        Arc::new(Self {
+    fn new_with_auth_source(
+        source: SharedCodexAuthSource,
+    ) -> Result<Arc<Self>, rtinfer_core::RealtimeError> {
+        let (codex_responses_client, responses_prewarm) =
+            build_codex_responses_client(Some(source.clone()))?;
+        Ok(Arc::new(Self {
             warm_realtime: WarmSessionPool::new(WARM_SESSIONS_PER_MODEL, Some(source.clone())),
-            codex_responses_pool: responses_pool_builder().auth_source(source.clone()).build(),
+            codex_responses_client,
+            responses_prewarm,
             realtime_threads: ThreadRegistry::new(Some(source.clone())),
             auth_source: Some(source),
-        })
+        }))
     }
 }
 
@@ -123,7 +132,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 pub async fn serve(port: u16, cse_toold_bin: Option<PathBuf>) -> anyhow::Result<()> {
     let state = match cse_toold_bin {
         Some(bin) => AppState::new_cse_toold(bin)?,
-        None => AppState::new_file_auth(),
+        None => AppState::new_file_auth()?,
     };
     let app = router(state.clone());
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
@@ -133,17 +142,13 @@ pub async fn serve(port: u16, cse_toold_bin: Option<PathBuf>) -> anyhow::Result<
     crate::endpoint_file::write(&base_url)?;
     info!(%base_url, version = crate::self_update::current_version(), "rtinfer: serving");
 
-    // Background prewarm: park warm codex/responses sockets in the idle pool so
-    // heavy fan-out (jsp-evidence) never pays cold-start handshakes. Off by
-    // default; RTINFER_RESPONSES_PREWARM=<n> enables it.
-    if let Some(n) = std::env::var("RTINFER_RESPONSES_PREWARM")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-    {
-        let pool = state.codex_responses_pool.clone();
+    // Background prewarm from the validated runtime config. HTTP mode skips
+    // WSS opens inside the coordinator; zero means off.
+    if state.responses_prewarm > 0 {
+        let client = state.codex_responses_client.clone();
+        let n = state.responses_prewarm;
         tokio::spawn(async move {
-            pool.prewarm(n).await;
+            client.prewarm(n).await;
             tracing::info!(sockets = n, "rtinfer: responses prewarm pass complete");
         });
     }
@@ -755,6 +760,35 @@ fn openai_chat_tool_stream_response(model: &str, turn: &WarmToolTurn) -> Respons
         .into_response()
 }
 
+/// Bounded, non-sensitive fields for upstream-error observability.
+///
+/// Never includes provider message bodies, auth/path/token/account material,
+/// prompts, outputs, or raw frames — only the tier and a stable `code_or_label`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpstreamErrorLogData<'a> {
+    tier: &'a str,
+    code_or_label: String,
+}
+
+impl UpstreamErrorLogData<'_> {
+    /// Formatter seam asserted by redaction tests (mirrors production fields).
+    #[cfg(test)]
+    fn format_log_line(&self) -> String {
+        format!("tier={} code_or_label={}", self.tier, self.code_or_label)
+    }
+}
+
+/// Extract the only fields allowed in daemon upstream-error logs.
+fn upstream_error_log_data<'a>(
+    tier: &'a str,
+    err: &rtinfer_core::RealtimeError,
+) -> UpstreamErrorLogData<'a> {
+    UpstreamErrorLogData {
+        tier,
+        code_or_label: err.code_or_label(),
+    }
+}
+
 /// Map a `RealtimeError` from either pool onto the rtinfer error envelope.
 fn rtinfer_map_realtime_err(tier: &str, err: rtinfer_core::RealtimeError) -> Response {
     use rtinfer_core::RealtimeError as RE;
@@ -781,11 +815,16 @@ fn rtinfer_map_realtime_err(tier: &str, err: rtinfer_core::RealtimeError) -> Res
     };
     // Never echo provider message bodies verbatim (they can carry
     // bearer-equivalent material); a stable, tier-scoped label is enough.
-    tracing::warn!(tier = %tier, error = %err, "rtinfer: upstream model error");
+    let log = upstream_error_log_data(tier, &err);
+    tracing::warn!(
+        tier = %log.tier,
+        code_or_label = %log.code_or_label,
+        "rtinfer: upstream model error"
+    );
     rtinfer_err(
         status,
         code,
-        format!("{tier} upstream error: {}", err.code_or_label()),
+        format!("{tier} upstream error: {}", log.code_or_label),
         retryable,
     )
 }
@@ -855,11 +894,16 @@ async fn openai_chat_completions(
             Ok(turn) if req.stream => openai_chat_tool_stream_response(&req.model, &turn),
             Ok(turn) => openai_chat_tool_response(&req.model, &turn),
             Err(e) => {
-                tracing::warn!(model = %req.model, error = %e, "rtinfer: openai chat tool upstream error");
+                let label = e.code_or_label();
+                tracing::warn!(
+                    model = %req.model,
+                    code_or_label = %label,
+                    "rtinfer: openai chat tool upstream error"
+                );
                 openai_err(
                     StatusCode::BAD_GATEWAY,
                     "provider_error",
-                    format!("realtime upstream error: {}", e.code_or_label()),
+                    format!("realtime upstream error: {label}"),
                 )
             }
         };
@@ -882,11 +926,16 @@ async fn openai_chat_completions(
         Ok(text) if req.stream => openai_chat_stream_response(&req.model, &text),
         Ok(text) => openai_chat_response(&req.model, &text),
         Err(e) => {
-            tracing::warn!(model = %req.model, error = %e, "rtinfer: openai chat upstream error");
+            let label = e.code_or_label();
+            tracing::warn!(
+                model = %req.model,
+                code_or_label = %label,
+                "rtinfer: openai chat upstream error"
+            );
             openai_err(
                 StatusCode::BAD_GATEWAY,
                 "provider_error",
-                format!("realtime upstream error: {}", e.code_or_label()),
+                format!("realtime upstream error: {label}"),
             )
         }
     }
@@ -1172,11 +1221,16 @@ async fn openai_responses(
             Ok(turn) if req.stream => openai_responses_tool_stream(&req.model, &turn),
             Ok(turn) => openai_responses_tool_non_stream(&req.model, &turn),
             Err(e) => {
-                tracing::warn!(model = %req.model, error = %e, "rtinfer: openai responses tool upstream error");
+                let label = e.code_or_label();
+                tracing::warn!(
+                    model = %req.model,
+                    code_or_label = %label,
+                    "rtinfer: openai responses tool upstream error"
+                );
                 openai_err(
                     StatusCode::BAD_GATEWAY,
                     "provider_error",
-                    format!("realtime upstream error: {}", e.code_or_label()),
+                    format!("realtime upstream error: {label}"),
                 )
             }
         };
@@ -1199,11 +1253,16 @@ async fn openai_responses(
         Ok(text) if req.stream => openai_responses_stream(&req.model, &text),
         Ok(text) => openai_responses_non_stream(&req.model, &text),
         Err(e) => {
-            tracing::warn!(model = %req.model, error = %e, "rtinfer: openai responses upstream error");
+            let label = e.code_or_label();
+            tracing::warn!(
+                model = %req.model,
+                code_or_label = %label,
+                "rtinfer: openai responses upstream error"
+            );
             openai_err(
                 StatusCode::BAD_GATEWAY,
                 "provider_error",
-                format!("realtime upstream error: {}", e.code_or_label()),
+                format!("realtime upstream error: {label}"),
             )
         }
     }
@@ -1307,13 +1366,13 @@ async fn rtinfer(State(state): State<Arc<AppState>>, Json(req): Json<RtInferRequ
                 );
             };
             match state
-                .codex_responses_pool
+                .codex_responses_client
                 .ask_structured(&req.system, &req.user, name, schema)
                 .await
             {
                 Ok(object) => Json(json!({
                     "contract": RTINFER_CONTRACT, "ok": true, "tier": "responses_structured",
-                    "object": object, "model": state.codex_responses_pool.model(),
+                    "object": object, "model": state.codex_responses_client.model(),
                 }))
                 .into_response(),
                 Err(e) => rtinfer_map_realtime_err("responses_structured", e),
@@ -1321,14 +1380,14 @@ async fn rtinfer(State(state): State<Arc<AppState>>, Json(req): Json<RtInferRequ
         }
         "responses_text" => {
             match state
-                .codex_responses_pool
+                .codex_responses_client
                 .ask_text(&req.system, &req.user, req.model.as_deref())
                 .await
             {
                 Ok(text) => Json(json!({
                     "contract": RTINFER_CONTRACT, "ok": true, "tier": "responses_text",
                     "text": text,
-                    "model": req.model.as_deref().unwrap_or(state.codex_responses_pool.model()),
+                    "model": req.model.as_deref().unwrap_or(state.codex_responses_client.model()),
                 }))
                 .into_response(),
                 Err(e) => rtinfer_map_realtime_err("responses_text", e),
@@ -1343,6 +1402,30 @@ async fn rtinfer(State(state): State<Arc<AppState>>, Json(req): Json<RtInferRequ
     }
 }
 
+fn responses_lane_health_json(lane: &TransportConcurrencySnapshot) -> Value {
+    let mut obj = json!({
+        "limit": lane.limit,
+        "in_flight": lane.in_flight,
+        "min": lane.min,
+        "max": lane.max,
+        "slow_start": lane.slow_start,
+        "sample_count": lane.sample_count,
+        "successes": lane.successes,
+        "lane_overloads": lane.lane_overloads,
+        "shared_throttles": lane.shared_throttles,
+        "failures": lane.failures,
+        "indeterminate": lane.indeterminate,
+        "cancellations": lane.cancellations,
+    });
+    // sample_count=0 means unmeasured; never report latency_ewma_ms:0 as a sample.
+    if lane.sample_count > 0 {
+        obj.as_object_mut()
+            .expect("lane health object")
+            .insert("latency_ewma_ms".into(), json!(lane.latency_ewma_ms));
+    }
+    obj
+}
+
 async fn rtinfer_health(State(state): State<Arc<AppState>>) -> Response {
     // Validate the configured source. Provider mode must not fall back to a
     // readable auth.json when its credential process fails.
@@ -1355,12 +1438,45 @@ async fn rtinfer_health(State(state): State<Arc<AppState>>) -> Response {
             "auth.json",
         ),
     };
+    let snap = state.codex_responses_client.snapshot().await;
+    let mut http = responses_lane_health_json(&snap.adaptive.http);
+    {
+        let http_obj = http.as_object_mut().expect("http health object");
+        http_obj.insert(
+            "connection_reuse_count".into(),
+            json!(snap.http_connection_reuse_count),
+        );
+        http_obj.insert("dispatches".into(), json!(snap.http_dispatches));
+    }
+    let mut websocket = responses_lane_health_json(&snap.adaptive.websocket);
+    {
+        let ws_obj = websocket.as_object_mut().expect("websocket health object");
+        ws_obj.insert("idle_sockets".into(), json!(snap.wss_idle_sockets));
+        ws_obj.insert("dispatches".into(), json!(snap.wss_dispatches));
+        ws_obj.insert(
+            "handshake_attempts".into(),
+            json!(snap.wss_handshake_attempts),
+        );
+        ws_obj.insert("active_asks".into(), json!(snap.wss_active_asks));
+    }
     Json(json!({
         "contract": RTINFER_CONTRACT,
         "ready": ready,
         "provider": "rtinferd",
         "auth_source": auth_source,
         "tiers": ["realtime_structured", "realtime_thread_structured", "responses_structured", "responses_text"],
+        "responses": {
+            "mode": snap.mode.as_str(),
+            "aggregate": {
+                "limit": snap.adaptive.aggregate.limit,
+                "in_flight": snap.adaptive.aggregate.in_flight,
+                "waiting": snap.adaptive.aggregate.waiting,
+                "throttled": snap.adaptive.aggregate.throttled,
+            },
+            "http": http,
+            "websocket": websocket,
+            "auth_generation": snap.auth_generation,
+        },
     }))
     .into_response()
 }
@@ -1371,8 +1487,82 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::to_bytes;
     use axum::http::StatusCode;
-    use rtinfer_core::{CodexAuth, CodexAuthSource, RealtimeError};
+    use rtinfer_core::{CodexAuth, CodexAuthSource, RealtimeError, ResponsesTransportMode};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    use tokio::sync::{Mutex, MutexGuard};
+
+    const RESPONSES_ENV_KEYS: &[&str] = &[
+        "RTINFER_RESPONSES_TRANSPORT",
+        "RTINFER_RESPONSES_HTTP_INITIAL",
+        "RTINFER_RESPONSES_HTTP_MAX",
+        "RTINFER_RESPONSES_WSS_INITIAL",
+        "RTINFER_RESPONSES_WSS_MAX",
+        "RTINFER_RESPONSES_AGGREGATE_MAX",
+        "RTINFER_RESPONSES_PREWARM",
+        "RTINFER_RESPONSES_CAPACITY",
+    ];
+
+    /// Serializes process-wide Responses env mutation across tests.
+    fn responses_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Dedicated runtime for synchronous tests that must acquire the env lock
+    /// without holding a `std` mutex across await (and without nesting in the
+    /// caller's Tokio runtime).
+    fn responses_env_sync_runtime() -> &'static tokio::runtime::Runtime {
+        static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        RT.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("responses env sync lock runtime")
+        })
+    }
+
+    /// Synchronous acquisition for `#[test]` (not `#[tokio::test]`).
+    fn lock_responses_env_sync() -> MutexGuard<'static, ()> {
+        responses_env_sync_runtime().block_on(responses_env_lock().lock())
+    }
+
+    /// Restores captured Responses env keys on drop.
+    struct ResponsesEnvGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl ResponsesEnvGuard {
+        fn capture() -> Self {
+            Self {
+                saved: RESPONSES_ENV_KEYS
+                    .iter()
+                    .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+                    .collect(),
+            }
+        }
+
+        fn clear_all() {
+            for key in RESPONSES_ENV_KEYS {
+                std::env::remove_var(key);
+            }
+        }
+
+        fn set(key: &str, value: &str) {
+            std::env::set_var(key, value);
+        }
+    }
+
+    impl Drop for ResponsesEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     struct HealthAuthSource {
         calls: AtomicUsize,
@@ -1409,17 +1599,28 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    async fn response_json(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap();
+        (status, body)
+    }
+
     #[tokio::test]
     async fn provider_source_is_shared_by_all_pools_and_health() {
+        let _lock = responses_env_lock().lock().await;
+        let _env = ResponsesEnvGuard::capture();
+        ResponsesEnvGuard::clear_all();
+
         let source = Arc::new(HealthAuthSource {
             calls: AtomicUsize::new(0),
             succeeds: true,
         });
         let shared: SharedCodexAuthSource = source.clone();
 
-        let state = AppState::new_with_auth_source(shared);
+        let state = AppState::new_with_auth_source(shared).unwrap();
 
-        // Caller + warm pool + responses pool + thread registry + health field.
+        // Caller + warm pool + responses auth cache + thread registry + health field.
         assert_eq!(Arc::strong_count(&source), 5);
         let health = health_json(state).await;
         assert_eq!(health["ready"], true);
@@ -1429,11 +1630,15 @@ mod tests {
 
     #[tokio::test]
     async fn provider_health_failure_is_not_masked_by_file_auth() {
+        let _lock = responses_env_lock().lock().await;
+        let _env = ResponsesEnvGuard::capture();
+        ResponsesEnvGuard::clear_all();
+
         let source: SharedCodexAuthSource = Arc::new(HealthAuthSource {
             calls: AtomicUsize::new(0),
             succeeds: false,
         });
-        let health = health_json(AppState::new_with_auth_source(source)).await;
+        let health = health_json(AppState::new_with_auth_source(source).unwrap()).await;
         assert_eq!(health["ready"], false);
         assert_eq!(health["auth_source"], "cse-toold");
     }
@@ -1449,20 +1654,378 @@ mod tests {
         assert!(src.contains(r#".route("/v1/responses", post(openai_responses))"#));
     }
 
+    #[tokio::test]
+    async fn responses_transport_defaults_to_wss() {
+        let _lock = responses_env_lock().lock().await;
+        let _env = ResponsesEnvGuard::capture();
+        ResponsesEnvGuard::clear_all();
+
+        let state = AppState::new_file_auth().unwrap();
+        assert_eq!(
+            state.codex_responses_client.mode(),
+            ResponsesTransportMode::Wss
+        );
+        let snap = state.codex_responses_client.snapshot().await;
+        assert_eq!(snap.mode, ResponsesTransportMode::Wss);
+        assert_eq!(snap.http_dispatches, 0);
+        assert_eq!(snap.wss_handshake_attempts, 0);
+
+        let health = health_json(state).await;
+        assert_eq!(health["responses"]["mode"], "wss");
+        assert_eq!(health["responses"]["http"]["dispatches"], 0);
+    }
+
+    #[tokio::test]
+    async fn responses_transport_explicit_modes() {
+        let _lock = responses_env_lock().lock().await;
+        let _env = ResponsesEnvGuard::capture();
+
+        ResponsesEnvGuard::clear_all();
+        ResponsesEnvGuard::set("RTINFER_RESPONSES_TRANSPORT", "http");
+        let http_state = AppState::new_file_auth().unwrap();
+        assert_eq!(
+            http_state.codex_responses_client.mode(),
+            ResponsesTransportMode::Http
+        );
+        let http_snap = http_state.codex_responses_client.snapshot().await;
+        assert_eq!(http_snap.mode, ResponsesTransportMode::Http);
+        assert_eq!(http_snap.wss_handshake_attempts, 0);
+        assert_eq!(http_snap.wss_dispatches, 0);
+        assert_eq!(http_snap.wss_idle_sockets, 0);
+        // HTTP mode must not schedule WSS prewarm opens.
+        http_state.codex_responses_client.prewarm(2).await;
+        let after = http_state.codex_responses_client.snapshot().await;
+        assert_eq!(after.wss_handshake_attempts, 0);
+        assert_eq!(after.wss_idle_sockets, 0);
+
+        ResponsesEnvGuard::clear_all();
+        ResponsesEnvGuard::set("RTINFER_RESPONSES_TRANSPORT", "dual");
+        let dual_state = AppState::new_file_auth().unwrap();
+        assert_eq!(
+            dual_state.codex_responses_client.mode(),
+            ResponsesTransportMode::Dual
+        );
+        let dual_health = health_json(dual_state).await;
+        assert_eq!(dual_health["responses"]["mode"], "dual");
+
+        ResponsesEnvGuard::clear_all();
+        ResponsesEnvGuard::set("RTINFER_RESPONSES_TRANSPORT", "wss");
+        let wss_state = AppState::new_file_auth().unwrap();
+        assert_eq!(
+            wss_state.codex_responses_client.mode(),
+            ResponsesTransportMode::Wss
+        );
+    }
+
+    fn expect_responses_config_err(result: Result<Arc<AppState>, RealtimeError>) -> RealtimeError {
+        match result {
+            Ok(_) => panic!("expected responses config construction failure"),
+            Err(e) => e,
+        }
+    }
+
     #[test]
-    fn error_envelope_carries_contract_and_code() {
+    fn responses_runtime_config_rejects_invalid_values() {
+        let _lock = lock_responses_env_sync();
+        let _env = ResponsesEnvGuard::capture();
+
+        let cases: &[(&str, &str)] = &[
+            ("RTINFER_RESPONSES_TRANSPORT", "udp"),
+            ("RTINFER_RESPONSES_HTTP_INITIAL", "0"),
+            ("RTINFER_RESPONSES_HTTP_MAX", "0"),
+            ("RTINFER_RESPONSES_WSS_INITIAL", "0"),
+            ("RTINFER_RESPONSES_WSS_MAX", "0"),
+            ("RTINFER_RESPONSES_HTTP_MAX", "257"),
+            ("RTINFER_RESPONSES_WSS_MAX", "65"),
+        ];
+        for (key, value) in cases {
+            ResponsesEnvGuard::clear_all();
+            ResponsesEnvGuard::set(key, value);
+            let err = expect_responses_config_err(AppState::new_file_auth());
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with("protocol error: responses config:"),
+                "key={key} value={value} got {msg}"
+            );
+        }
+
+        // initial > max
+        ResponsesEnvGuard::clear_all();
+        ResponsesEnvGuard::set("RTINFER_RESPONSES_HTTP_MAX", "4");
+        ResponsesEnvGuard::set("RTINFER_RESPONSES_HTTP_INITIAL", "8");
+        let err = expect_responses_config_err(AppState::new_file_auth());
+        assert!(err
+            .to_string()
+            .starts_with("protocol error: responses config:"));
+
+        ResponsesEnvGuard::clear_all();
+        ResponsesEnvGuard::set("RTINFER_RESPONSES_WSS_MAX", "4");
+        ResponsesEnvGuard::set("RTINFER_RESPONSES_WSS_INITIAL", "8");
+        let err = expect_responses_config_err(AppState::new_file_auth());
+        assert!(err
+            .to_string()
+            .starts_with("protocol error: responses config:"));
+
+        // dual aggregate below 2
+        ResponsesEnvGuard::clear_all();
+        ResponsesEnvGuard::set("RTINFER_RESPONSES_TRANSPORT", "dual");
+        ResponsesEnvGuard::set("RTINFER_RESPONSES_AGGREGATE_MAX", "1");
+        let err = expect_responses_config_err(AppState::new_file_auth());
+        assert!(err
+            .to_string()
+            .starts_with("protocol error: responses config:"));
+
+        // aggregate above enabled maxima sum
+        ResponsesEnvGuard::clear_all();
+        ResponsesEnvGuard::set("RTINFER_RESPONSES_TRANSPORT", "wss");
+        ResponsesEnvGuard::set("RTINFER_RESPONSES_WSS_MAX", "4");
+        ResponsesEnvGuard::set("RTINFER_RESPONSES_AGGREGATE_MAX", "5");
+        let err = expect_responses_config_err(AppState::new_file_auth());
+        assert!(err
+            .to_string()
+            .starts_with("protocol error: responses config:"));
+    }
+
+    #[tokio::test]
+    async fn legacy_zero_capacity_maps_to_hard_cap() {
+        let _lock = responses_env_lock().lock().await;
+        let _env = ResponsesEnvGuard::capture();
+        ResponsesEnvGuard::clear_all();
+        // Legacy alias only when WSS_MAX is absent.
+        ResponsesEnvGuard::set("RTINFER_RESPONSES_CAPACITY", "0");
+
+        let state = AppState::new_file_auth().unwrap();
+        let snap = state.codex_responses_client.snapshot().await;
+        assert_eq!(snap.adaptive.websocket.max, 64);
+        assert_eq!(snap.adaptive.websocket.limit, 4);
+        assert_eq!(snap.adaptive.aggregate.limit, 64);
+        let health = health_json(state).await;
+        assert_eq!(health["responses"]["websocket"]["max"], 64);
+    }
+
+    #[test]
+    fn responses_tiers_route_through_coordinator() {
+        let src = include_str!("server.rs");
+        assert!(src.contains("codex_responses_client"));
+        assert!(src.contains(r#""responses_structured" =>"#));
+        assert!(src.contains(r#""responses_text" =>"#));
+        assert!(src.contains(".codex_responses_client\n                .ask_structured"));
+        assert!(src.contains(".codex_responses_client\n                .ask_text"));
+        // Daemon handlers must not select lanes or acquire adaptive leases.
+        let structured_start = src.find(r#""responses_structured" =>"#).unwrap();
+        let text_start = src.find(r#""responses_text" =>"#).unwrap();
+        let end = src.find("other => rtinfer_err(").unwrap();
+        let handlers = &src[structured_start..end];
+        assert!(!handlers.contains("AdaptiveConcurrency"));
+        assert!(!handlers.contains("ResponsesTransportKind"));
+        assert!(!handlers.contains("acquire("));
+        assert!(text_start > structured_start);
+    }
+
+    /// Executable proof that the rtinfer handler selects the Responses tier
+    /// arm and returns its stable validation envelope without contacting upstream.
+    #[tokio::test]
+    async fn responses_structured_validation_error_via_handler() {
+        let _lock = responses_env_lock().lock().await;
+        let _env = ResponsesEnvGuard::capture();
+        ResponsesEnvGuard::clear_all();
+
+        let state = AppState::new_file_auth().unwrap();
+        // Router construction is exercised; handler is invoked for the
+        // responses_structured validation path (no live network).
+        let _app = router(state.clone());
+        let req: RtInferRequest = serde_json::from_value(json!({
+            "contract": RTINFER_CONTRACT,
+            "tier": "responses_structured",
+            "system": "sys",
+            "user": "ask",
+        }))
+        .unwrap();
+        let (status, body) = response_json(rtinfer(State(state), Json(req)).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["contract"], RTINFER_CONTRACT);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "bad_request");
+        assert_eq!(body["error"]["retryable"], false);
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("responses_structured requires schema_name and schema"),
+            "unexpected message: {message}"
+        );
+    }
+
+    /// Same envelope/route selection for responses_text unknown-tier vs known
+    /// tier: missing fields on a known Responses tier still hits that arm.
+    #[tokio::test]
+    async fn responses_text_unknown_tier_rejected_via_handler() {
+        let _lock = responses_env_lock().lock().await;
+        let _env = ResponsesEnvGuard::capture();
+        ResponsesEnvGuard::clear_all();
+
+        let state = AppState::new_file_auth().unwrap();
+        let _app = router(state.clone());
+        let req: RtInferRequest = serde_json::from_value(json!({
+            "contract": RTINFER_CONTRACT,
+            "tier": "responses_not_a_real_tier",
+        }))
+        .unwrap();
+        let (status, body) = response_json(rtinfer(State(state), Json(req)).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["contract"], RTINFER_CONTRACT);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "unsupported_tier");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("responses_not_a_real_tier"));
+    }
+
+    #[test]
+    fn openai_responses_remains_realtime_backed() {
+        let src = include_str!("server.rs");
+        let start = src
+            .find("async fn openai_responses(")
+            .expect("openai_responses");
+        let end = src.find("async fn rtinfer(").expect("rtinfer");
+        let body = &src[start..end];
+        assert!(body.contains("warm_realtime"));
+        assert!(body.contains(".ask_text(") || body.contains(".ask_tools("));
+        assert!(
+            !body.contains("codex_responses_client"),
+            "/v1/responses must stay Realtime-backed"
+        );
+        assert!(!body.contains("ask_structured"));
+    }
+
+    #[tokio::test]
+    async fn responses_health_exposes_bounded_snapshot() {
+        let _lock = responses_env_lock().lock().await;
+        let _env = ResponsesEnvGuard::capture();
+        ResponsesEnvGuard::clear_all();
+
+        let state = AppState::new_file_auth().unwrap();
+        let health = health_json(state).await;
+
+        // Existing top-level fields preserved.
+        assert_eq!(health["contract"], RTINFER_CONTRACT);
+        assert!(health["ready"].is_boolean());
+        assert_eq!(health["provider"], "rtinferd");
+        assert!(health["auth_source"].is_string());
+        assert_eq!(
+            health["tiers"],
+            json!([
+                "realtime_structured",
+                "realtime_thread_structured",
+                "responses_structured",
+                "responses_text"
+            ])
+        );
+
+        let responses = &health["responses"];
+        assert_eq!(responses["mode"], "wss");
+        assert!(responses["auth_generation"].is_number());
+
+        let aggregate = &responses["aggregate"];
+        assert!(aggregate["limit"].as_u64().unwrap() <= 64);
+        assert_eq!(aggregate["in_flight"], 0);
+        assert_eq!(aggregate["waiting"], 0);
+        assert_eq!(aggregate["throttled"], false);
+
+        for lane_name in ["http", "websocket"] {
+            let lane = &responses[lane_name];
+            let limit = lane["limit"].as_u64().unwrap() as usize;
+            let max = lane["max"].as_u64().unwrap() as usize;
+            let in_flight = lane["in_flight"].as_u64().unwrap() as usize;
+            let min = lane["min"].as_u64().unwrap() as usize;
+            assert!(min >= 1);
+            assert!(limit >= min && limit <= max);
+            assert!(in_flight <= limit);
+            assert!(lane["sample_count"].as_u64().unwrap() == 0);
+            assert!(lane.get("latency_ewma_ms").is_none());
+            assert!(lane["dispatches"].is_number());
+        }
+        assert!(responses["http"]["connection_reuse_count"].is_number());
+        assert!(responses["websocket"]["handshake_attempts"].is_number());
+        assert!(responses["websocket"]["idle_sockets"].is_number());
+        assert!(responses["websocket"]["active_asks"].is_number());
+        assert!(responses["websocket"]["max"].as_u64().unwrap() <= 64);
+        assert!(responses["http"]["max"].as_u64().unwrap() <= 256);
+    }
+
+    #[tokio::test]
+    async fn error_envelope_carries_contract_and_code() {
         let resp = rtinfer_err(StatusCode::BAD_GATEWAY, "provider_error", "boom", true);
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let (status, body) = response_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["contract"], RTINFER_CONTRACT);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "provider_error");
+        assert_eq!(body["error"]["message"], "boom");
+        assert_eq!(body["error"]["retryable"], true);
     }
 
-    #[test]
-    fn openai_error_envelope_uses_requested_status() {
+    #[tokio::test]
+    async fn openai_error_envelope_uses_requested_status() {
         let resp = openai_err(StatusCode::BAD_REQUEST, "invalid_request_error", "boom");
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let (status, body) = response_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_request_error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["message"], "boom");
     }
 
-    #[test]
-    fn unknown_contract_is_rejected_shape() {
+    /// Provider-message sentinels must not appear in the bounded log seam or
+    /// the stable HTTP envelope produced by `rtinfer_map_realtime_err`.
+    #[tokio::test]
+    async fn upstream_error_log_and_envelope_redact_provider_message_sentinel() {
+        const SENTINEL: &str = "SECRET_PROVIDER_MSG_sentinel_bearer_sk-test-do-not-log-xyzzy";
+        let err = RealtimeError::Provider {
+            code: "rate_limit_exceeded".into(),
+            message: SENTINEL.into(),
+        };
+        // Fixture sanity: Display still carries the body (what we must not log).
+        assert!(
+            err.to_string().contains(SENTINEL),
+            "fixture Display must contain sentinel so redaction is meaningful"
+        );
+
+        let log = upstream_error_log_data("responses_structured", &err);
+        assert_eq!(log.tier, "responses_structured");
+        assert_eq!(log.code_or_label, "provider:rate_limit_exceeded");
+        let formatted = log.format_log_line();
+        assert!(
+            !formatted.contains(SENTINEL),
+            "log formatter seam leaked sentinel: {formatted}"
+        );
+        assert!(!log.code_or_label.contains(SENTINEL));
+        assert!(!format!("{log:?}").contains(SENTINEL));
+
+        let (status, body) =
+            response_json(rtinfer_map_realtime_err("responses_structured", err)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["contract"], RTINFER_CONTRACT);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "provider_error");
+        assert_eq!(body["error"]["retryable"], true);
+        let envelope = body.to_string();
+        assert!(
+            !envelope.contains(SENTINEL),
+            "HTTP envelope leaked sentinel: {envelope}"
+        );
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("responses_structured upstream error: provider:rate_limit_exceeded")
+        );
+        assert!(!message.contains(SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn unknown_contract_is_rejected_via_handler() {
+        let _lock = responses_env_lock().lock().await;
+        let _env = ResponsesEnvGuard::capture();
+        ResponsesEnvGuard::clear_all();
+
+        let state = AppState::new_file_auth().unwrap();
         let req: RtInferRequest = serde_json::from_value(json!({
             "contract": "rtinfer/2",
             "tier": "responses_text",
@@ -1470,6 +2033,15 @@ mod tests {
         .unwrap();
         assert_eq!(req.contract, "rtinfer/2");
         assert_eq!(req.tier, "responses_text");
+        let (status, body) = response_json(rtinfer(State(state), Json(req)).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["contract"], RTINFER_CONTRACT);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "bad_request");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown contract rtinfer/2"));
     }
 
     #[test]

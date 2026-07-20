@@ -111,7 +111,7 @@ async fn live_smoke_ask_structured_round_trip() {
         .expect("live round-trip must succeed");
     assert_eq!(out["is_real_work"], serde_json::Value::Bool(true));
     assert!(out["start"].as_str().unwrap().starts_with("2026-06-05T23"));
-    eprintln!("LIVE OK: {out}");
+    // Do not print content/auth.
 }
 
 #[test]
@@ -125,4 +125,49 @@ fn done_text_authoritative_over_partial_deltas() {
     ];
     let text = rtinfer_core::assemble_codex_responses_text(&frames).unwrap();
     assert_eq!(text, "{\"ok\":true}");
+}
+
+#[test]
+fn incomplete_wss_stream_is_rejected() {
+    let frames = vec![
+        serde_json::json!({"type": "response.output_text.delta", "delta": "partial"}),
+        serde_json::json!({"type": "response.output_text.done", "text": "partial"}),
+    ];
+    let err = rtinfer_core::assemble_codex_responses_text(&frames).unwrap_err();
+    assert_eq!(err.code_or_label(), "protocol");
+}
+
+#[test]
+fn completed_status_and_text_are_required() {
+    let empty = vec![
+        serde_json::json!({"type": "response.completed", "response": {"status": "completed"}}),
+    ];
+    let err = rtinfer_core::assemble_codex_responses_text(&empty).unwrap_err();
+    assert_eq!(err.code_or_label(), "protocol");
+
+    let bad_status = vec![
+        serde_json::json!({"type": "response.output_text.done", "text": "x"}),
+        serde_json::json!({"type": "response.completed", "response": {"status": "failed"}}),
+    ];
+    let err = rtinfer_core::assemble_codex_responses_text(&bad_status).unwrap_err();
+    assert_eq!(err.code_or_label(), "protocol");
+
+    let ok = vec![
+        serde_json::json!({"type": "response.output_text.done", "text": "ok"}),
+        serde_json::json!({"type": "response.completed"}),
+    ];
+    assert_eq!(
+        rtinfer_core::assemble_codex_responses_text(&ok).unwrap(),
+        "ok"
+    );
+}
+
+#[test]
+fn incomplete_wss_after_partial_delta_is_protocol() {
+    // Assembler-only: incomplete after partial text is never success.
+    // Exact WSS response.create send-count / no-replay is owned by
+    // responses_dual_transport fixture tests (wss_incomplete_attempt_is_dropped_not_replayed).
+    let frames = vec![serde_json::json!({"type": "response.output_text.delta", "delta": "x"})];
+    let err = rtinfer_core::assemble_codex_responses_text(&frames).unwrap_err();
+    assert_eq!(err.code_or_label(), "protocol");
 }

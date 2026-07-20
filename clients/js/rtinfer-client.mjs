@@ -33,14 +33,16 @@ const SCORER_MODEL = (process.env.EXPLORE_SEARCH_SCORER_MODEL || "gpt-realtime-2
 const HEALTH_TIMEOUT_MS = Math.round(
   (parseFloat(process.env.EXPLORE_SEARCH_DAEMON_CONNECT || "") || 0.5) * 1000,
 );
+// Per-request wall clock for structured tiers (realtime + responses_structured).
+// Saturated local fan-out can wait minutes behind a healthy warm pool; the old
+// 20s default aborted those as client-side failures. Override via env.
 const REQUEST_TIMEOUT_MS = Math.round(
-  (parseFloat(process.env.EXPLORE_SEARCH_DAEMON_REQUEST || "") || 20.0) * 1000,
+  (parseFloat(process.env.EXPLORE_SEARCH_DAEMON_REQUEST || "") || 300.0) * 1000,
 );
-// Synthesis (responses_text, gpt-5.x map-reduce) runs ~30s on a full pack and
-// far longer on a map-reduce, so it gets its own higher ceiling. The realtime
-// navigator/scorer tiers keep the tight 20s timeout above.
+// Synthesis (responses_text, gpt-5.x map-reduce) can run longer than a single
+// structured ask under map-reduce; keep a separate knob, same generous default.
 const SYNTH_REQUEST_TIMEOUT_MS = Math.round(
-  (parseFloat(process.env.EXPLORE_SEARCH_DAEMON_SYNTH_REQUEST || "") || 90.0) * 1000,
+  (parseFloat(process.env.EXPLORE_SEARCH_DAEMON_SYNTH_REQUEST || "") || 300.0) * 1000,
 );
 
 let _resolved = false;

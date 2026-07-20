@@ -1,0 +1,394 @@
+{
+  "config": {
+    "mode_order_rotation": [
+      [
+        "wss",
+        "http",
+        "dual"
+      ],
+      [
+        "http",
+        "dual",
+        "wss"
+      ],
+      [
+        "dual",
+        "wss",
+        "http"
+      ]
+    ],
+    "repetitions": 3,
+    "requests": 24,
+    "runtime": {
+      "aggregate_max": 320,
+      "default_mode": "wss",
+      "http_initial": 8,
+      "http_max": 256,
+      "wss_initial": 4,
+      "wss_max": 64
+    },
+    "warmups": 4
+  },
+  "dual_lane_load": {
+    "both_lanes_carried_load": true,
+    "http_dispatches": 47,
+    "http_successes": 47,
+    "wss_dispatches": 25,
+    "wss_successes": 25
+  },
+  "medians": {
+    "best_single_completed_per_sec": 3.7952132453256,
+    "dual_completed_per_sec": 5.161151212351635,
+    "dual_threshold_completed_per_sec": 3.98497390759188,
+    "http_completed_per_sec": 3.7952132453256,
+    "wss_completed_per_sec": 3.3903904257069573
+  },
+  "model": "gpt-5.4",
+  "reason": null,
+  "runs": [
+    {
+      "capacity_snapshot": {
+        "aggregate_limit": 64,
+        "http_lane_overload_delta": 0,
+        "http_limit": 8,
+        "http_max": 256,
+        "http_shared_throttle_delta": 0,
+        "wss_lane_overload_delta": 0,
+        "wss_limit": 6,
+        "wss_max": 64,
+        "wss_shared_throttle_delta": 0
+      },
+      "classes": {
+        "failure": 0,
+        "indeterminate": 0,
+        "lane_overload": 0,
+        "shared_throttle": 0,
+        "success": 24
+      },
+      "completed": 24,
+      "completed_per_sec": 3.0766008554434583,
+      "failure": 0,
+      "lane_dispatch_deltas": {
+        "http": 0,
+        "wss": 24
+      },
+      "lane_success_deltas": {
+        "http": 0,
+        "wss": 24
+      },
+      "mode": "wss",
+      "repetition": 0,
+      "reuse_handshake_deltas": {
+        "http_connection_reuse": 0,
+        "wss_handshake_attempts": 1
+      },
+      "wall_seconds": 7.800816917
+    },
+    {
+      "capacity_snapshot": {
+        "aggregate_limit": 256,
+        "http_lane_overload_delta": 0,
+        "http_limit": 9,
+        "http_max": 256,
+        "http_shared_throttle_delta": 0,
+        "wss_lane_overload_delta": 0,
+        "wss_limit": 4,
+        "wss_max": 64,
+        "wss_shared_throttle_delta": 0
+      },
+      "classes": {
+        "failure": 0,
+        "indeterminate": 0,
+        "lane_overload": 0,
+        "shared_throttle": 0,
+        "success": 24
+      },
+      "completed": 24,
+      "completed_per_sec": 4.908755104947308,
+      "failure": 0,
+      "lane_dispatch_deltas": {
+        "http": 24,
+        "wss": 0
+      },
+      "lane_success_deltas": {
+        "http": 24,
+        "wss": 0
+      },
+      "mode": "http",
+      "repetition": 0,
+      "reuse_handshake_deltas": {
+        "http_connection_reuse": 24,
+        "wss_handshake_attempts": 0
+      },
+      "wall_seconds": 4.889223334
+    },
+    {
+      "capacity_snapshot": {
+        "aggregate_limit": 320,
+        "http_lane_overload_delta": 0,
+        "http_limit": 9,
+        "http_max": 256,
+        "http_shared_throttle_delta": 0,
+        "wss_lane_overload_delta": 0,
+        "wss_limit": 5,
+        "wss_max": 64,
+        "wss_shared_throttle_delta": 0
+      },
+      "classes": {
+        "failure": 0,
+        "indeterminate": 0,
+        "lane_overload": 0,
+        "shared_throttle": 0,
+        "success": 24
+      },
+      "completed": 24,
+      "completed_per_sec": 6.422929644734046,
+      "failure": 0,
+      "lane_dispatch_deltas": {
+        "http": 15,
+        "wss": 9
+      },
+      "lane_success_deltas": {
+        "http": 15,
+        "wss": 9
+      },
+      "mode": "dual",
+      "repetition": 0,
+      "reuse_handshake_deltas": {
+        "http_connection_reuse": 15,
+        "wss_handshake_attempts": 3
+      },
+      "wall_seconds": 3.7366126250000002
+    },
+    {
+      "capacity_snapshot": {
+        "aggregate_limit": 256,
+        "http_lane_overload_delta": 0,
+        "http_limit": 9,
+        "http_max": 256,
+        "http_shared_throttle_delta": 0,
+        "wss_lane_overload_delta": 0,
+        "wss_limit": 4,
+        "wss_max": 64,
+        "wss_shared_throttle_delta": 0
+      },
+      "classes": {
+        "failure": 0,
+        "indeterminate": 0,
+        "lane_overload": 0,
+        "shared_throttle": 0,
+        "success": 24
+      },
+      "completed": 24,
+      "completed_per_sec": 3.7952132453256,
+      "failure": 0,
+      "lane_dispatch_deltas": {
+        "http": 24,
+        "wss": 0
+      },
+      "lane_success_deltas": {
+        "http": 24,
+        "wss": 0
+      },
+      "mode": "http",
+      "repetition": 1,
+      "reuse_handshake_deltas": {
+        "http_connection_reuse": 24,
+        "wss_handshake_attempts": 0
+      },
+      "wall_seconds": 6.323755333
+    },
+    {
+      "capacity_snapshot": {
+        "aggregate_limit": 320,
+        "http_lane_overload_delta": 0,
+        "http_limit": 9,
+        "http_max": 256,
+        "http_shared_throttle_delta": 0,
+        "wss_lane_overload_delta": 0,
+        "wss_limit": 5,
+        "wss_max": 64,
+        "wss_shared_throttle_delta": 0
+      },
+      "classes": {
+        "failure": 0,
+        "indeterminate": 0,
+        "lane_overload": 0,
+        "shared_throttle": 0,
+        "success": 24
+      },
+      "completed": 24,
+      "completed_per_sec": 5.161151212351635,
+      "failure": 0,
+      "lane_dispatch_deltas": {
+        "http": 17,
+        "wss": 7
+      },
+      "lane_success_deltas": {
+        "http": 17,
+        "wss": 7
+      },
+      "mode": "dual",
+      "repetition": 1,
+      "reuse_handshake_deltas": {
+        "http_connection_reuse": 17,
+        "wss_handshake_attempts": 3
+      },
+      "wall_seconds": 4.650125333
+    },
+    {
+      "capacity_snapshot": {
+        "aggregate_limit": 64,
+        "http_lane_overload_delta": 0,
+        "http_limit": 8,
+        "http_max": 256,
+        "http_shared_throttle_delta": 0,
+        "wss_lane_overload_delta": 0,
+        "wss_limit": 6,
+        "wss_max": 64,
+        "wss_shared_throttle_delta": 0
+      },
+      "classes": {
+        "failure": 0,
+        "indeterminate": 0,
+        "lane_overload": 0,
+        "shared_throttle": 0,
+        "success": 24
+      },
+      "completed": 24,
+      "completed_per_sec": 4.026860361298825,
+      "failure": 0,
+      "lane_dispatch_deltas": {
+        "http": 0,
+        "wss": 24
+      },
+      "lane_success_deltas": {
+        "http": 0,
+        "wss": 24
+      },
+      "mode": "wss",
+      "repetition": 1,
+      "reuse_handshake_deltas": {
+        "http_connection_reuse": 0,
+        "wss_handshake_attempts": 1
+      },
+      "wall_seconds": 5.959978208
+    },
+    {
+      "capacity_snapshot": {
+        "aggregate_limit": 320,
+        "http_lane_overload_delta": 0,
+        "http_limit": 9,
+        "http_max": 256,
+        "http_shared_throttle_delta": 0,
+        "wss_lane_overload_delta": 0,
+        "wss_limit": 5,
+        "wss_max": 64,
+        "wss_shared_throttle_delta": 0
+      },
+      "classes": {
+        "failure": 0,
+        "indeterminate": 0,
+        "lane_overload": 0,
+        "shared_throttle": 0,
+        "success": 24
+      },
+      "completed": 24,
+      "completed_per_sec": 4.949799239236482,
+      "failure": 0,
+      "lane_dispatch_deltas": {
+        "http": 15,
+        "wss": 9
+      },
+      "lane_success_deltas": {
+        "http": 15,
+        "wss": 9
+      },
+      "mode": "dual",
+      "repetition": 2,
+      "reuse_handshake_deltas": {
+        "http_connection_reuse": 15,
+        "wss_handshake_attempts": 3
+      },
+      "wall_seconds": 4.8486815
+    },
+    {
+      "capacity_snapshot": {
+        "aggregate_limit": 64,
+        "http_lane_overload_delta": 0,
+        "http_limit": 8,
+        "http_max": 256,
+        "http_shared_throttle_delta": 0,
+        "wss_lane_overload_delta": 0,
+        "wss_limit": 6,
+        "wss_max": 64,
+        "wss_shared_throttle_delta": 0
+      },
+      "classes": {
+        "failure": 0,
+        "indeterminate": 0,
+        "lane_overload": 0,
+        "shared_throttle": 0,
+        "success": 24
+      },
+      "completed": 24,
+      "completed_per_sec": 3.3903904257069573,
+      "failure": 0,
+      "lane_dispatch_deltas": {
+        "http": 0,
+        "wss": 24
+      },
+      "lane_success_deltas": {
+        "http": 0,
+        "wss": 24
+      },
+      "mode": "wss",
+      "repetition": 2,
+      "reuse_handshake_deltas": {
+        "http_connection_reuse": 0,
+        "wss_handshake_attempts": 1
+      },
+      "wall_seconds": 7.07883075
+    },
+    {
+      "capacity_snapshot": {
+        "aggregate_limit": 256,
+        "http_lane_overload_delta": 0,
+        "http_limit": 9,
+        "http_max": 256,
+        "http_shared_throttle_delta": 0,
+        "wss_lane_overload_delta": 0,
+        "wss_limit": 4,
+        "wss_max": 64,
+        "wss_shared_throttle_delta": 0
+      },
+      "classes": {
+        "failure": 0,
+        "indeterminate": 0,
+        "lane_overload": 0,
+        "shared_throttle": 0,
+        "success": 24
+      },
+      "completed": 24,
+      "completed_per_sec": 2.0661704133058203,
+      "failure": 0,
+      "lane_dispatch_deltas": {
+        "http": 24,
+        "wss": 0
+      },
+      "lane_success_deltas": {
+        "http": 24,
+        "wss": 0
+      },
+      "mode": "http",
+      "repetition": 2,
+      "reuse_handshake_deltas": {
+        "http_connection_reuse": 24,
+        "wss_handshake_attempts": 0
+      },
+      "wall_seconds": 11.615692416
+    }
+  ],
+  "verdict": "pass",
+  "version": "0.1.14"
+}

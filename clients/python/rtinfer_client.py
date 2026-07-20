@@ -68,7 +68,9 @@ def _env_float(name: str, default: float) -> float:
 
 
 HEALTH_TIMEOUT = _env_float("CSE_RTINFER_HEALTH_TIMEOUT", 0.5)
-REQUEST_TIMEOUT = _env_float("CSE_RTINFER_REQUEST_TIMEOUT", 95.0)
+# Saturated local fan-out can wait minutes behind a healthy warm pool; keep the
+# client wall clock above typical queue+inference latency. Override via env.
+REQUEST_TIMEOUT = _env_float("CSE_RTINFER_REQUEST_TIMEOUT", 300.0)
 # Re-discovery is cheap but not free; cache the resolved base for this process.
 _DISCOVERY_TTL = _env_float("CSE_RTINFER_DISCOVERY_TTL", 30.0)
 
