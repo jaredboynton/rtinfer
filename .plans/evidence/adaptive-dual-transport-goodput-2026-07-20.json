@@ -20,28 +20,40 @@
     "repetitions": 3,
     "requests": 24,
     "runtime": {
-      "aggregate_max": 320,
+      "aggregate_max_by_mode": {
+        "dual": 320,
+        "http": 256,
+        "wss": 64
+      },
       "default_mode": "wss",
       "http_initial": 8,
       "http_max": 256,
       "wss_initial": 4,
       "wss_max": 64
     },
-    "warmups": 4
+    "warmups": 4,
+    "wss_prewarm": {
+      "count_per_enabled_mode": 4,
+      "enabled_modes": [
+        "wss",
+        "dual"
+      ],
+      "policy": "enabled_wss_lane_to_configured_initial_before_generic_warmups"
+    }
   },
   "dual_lane_load": {
     "both_lanes_carried_load": true,
-    "http_dispatches": 47,
-    "http_successes": 47,
-    "wss_dispatches": 25,
-    "wss_successes": 25
+    "http_dispatches": 44,
+    "http_successes": 44,
+    "wss_dispatches": 28,
+    "wss_successes": 28
   },
   "medians": {
-    "best_single_completed_per_sec": 3.7952132453256,
-    "dual_completed_per_sec": 5.161151212351635,
-    "dual_threshold_completed_per_sec": 3.98497390759188,
-    "http_completed_per_sec": 3.7952132453256,
-    "wss_completed_per_sec": 3.3903904257069573
+    "best_single_completed_per_sec": 4.171450466507984,
+    "dual_completed_per_sec": 4.618199534113029,
+    "dual_threshold_completed_per_sec": 4.380022989833384,
+    "http_completed_per_sec": 3.3461074279381213,
+    "wss_completed_per_sec": 4.171450466507984
   },
   "model": "gpt-5.4",
   "reason": null,
@@ -66,7 +78,7 @@
         "success": 24
       },
       "completed": 24,
-      "completed_per_sec": 3.0766008554434583,
+      "completed_per_sec": 3.8726689579372797,
       "failure": 0,
       "lane_dispatch_deltas": {
         "http": 0,
@@ -82,7 +94,11 @@
         "http_connection_reuse": 0,
         "wss_handshake_attempts": 1
       },
-      "wall_seconds": 7.800816917
+      "wall_seconds": 6.197276416,
+      "wss_prewarm": {
+        "attained": 4,
+        "target": 4
+      }
     },
     {
       "capacity_snapshot": {
@@ -104,7 +120,7 @@
         "success": 24
       },
       "completed": 24,
-      "completed_per_sec": 4.908755104947308,
+      "completed_per_sec": 4.530424739540153,
       "failure": 0,
       "lane_dispatch_deltas": {
         "http": 24,
@@ -120,7 +136,11 @@
         "http_connection_reuse": 24,
         "wss_handshake_attempts": 0
       },
-      "wall_seconds": 4.889223334
+      "wall_seconds": 5.297516542,
+      "wss_prewarm": {
+        "attained": 0,
+        "target": 0
+      }
     },
     {
       "capacity_snapshot": {
@@ -142,7 +162,7 @@
         "success": 24
       },
       "completed": 24,
-      "completed_per_sec": 6.422929644734046,
+      "completed_per_sec": 6.252787701183444,
       "failure": 0,
       "lane_dispatch_deltas": {
         "http": 15,
@@ -156,9 +176,13 @@
       "repetition": 0,
       "reuse_handshake_deltas": {
         "http_connection_reuse": 15,
-        "wss_handshake_attempts": 3
+        "wss_handshake_attempts": 0
       },
-      "wall_seconds": 3.7366126250000002
+      "wall_seconds": 3.838288,
+      "wss_prewarm": {
+        "attained": 4,
+        "target": 4
+      }
     },
     {
       "capacity_snapshot": {
@@ -180,7 +204,7 @@
         "success": 24
       },
       "completed": 24,
-      "completed_per_sec": 3.7952132453256,
+      "completed_per_sec": 3.192552449402621,
       "failure": 0,
       "lane_dispatch_deltas": {
         "http": 24,
@@ -196,7 +220,11 @@
         "http_connection_reuse": 24,
         "wss_handshake_attempts": 0
       },
-      "wall_seconds": 6.323755333
+      "wall_seconds": 7.517495916,
+      "wss_prewarm": {
+        "attained": 0,
+        "target": 0
+      }
     },
     {
       "capacity_snapshot": {
@@ -218,23 +246,27 @@
         "success": 24
       },
       "completed": 24,
-      "completed_per_sec": 5.161151212351635,
+      "completed_per_sec": 4.618199534113029,
       "failure": 0,
       "lane_dispatch_deltas": {
-        "http": 17,
-        "wss": 7
+        "http": 14,
+        "wss": 10
       },
       "lane_success_deltas": {
-        "http": 17,
-        "wss": 7
+        "http": 14,
+        "wss": 10
       },
       "mode": "dual",
       "repetition": 1,
       "reuse_handshake_deltas": {
-        "http_connection_reuse": 17,
-        "wss_handshake_attempts": 3
+        "http_connection_reuse": 14,
+        "wss_handshake_attempts": 0
       },
-      "wall_seconds": 4.650125333
+      "wall_seconds": 5.196830458,
+      "wss_prewarm": {
+        "attained": 4,
+        "target": 4
+      }
     },
     {
       "capacity_snapshot": {
@@ -256,7 +288,7 @@
         "success": 24
       },
       "completed": 24,
-      "completed_per_sec": 4.026860361298825,
+      "completed_per_sec": 4.290575821485299,
       "failure": 0,
       "lane_dispatch_deltas": {
         "http": 0,
@@ -272,7 +304,11 @@
         "http_connection_reuse": 0,
         "wss_handshake_attempts": 1
       },
-      "wall_seconds": 5.959978208
+      "wall_seconds": 5.593654791,
+      "wss_prewarm": {
+        "attained": 4,
+        "target": 4
+      }
     },
     {
       "capacity_snapshot": {
@@ -294,7 +330,7 @@
         "success": 24
       },
       "completed": 24,
-      "completed_per_sec": 4.949799239236482,
+      "completed_per_sec": 4.178554781974002,
       "failure": 0,
       "lane_dispatch_deltas": {
         "http": 15,
@@ -308,9 +344,13 @@
       "repetition": 2,
       "reuse_handshake_deltas": {
         "http_connection_reuse": 15,
-        "wss_handshake_attempts": 3
+        "wss_handshake_attempts": 0
       },
-      "wall_seconds": 4.8486815
+      "wall_seconds": 5.743612625,
+      "wss_prewarm": {
+        "attained": 4,
+        "target": 4
+      }
     },
     {
       "capacity_snapshot": {
@@ -332,7 +372,7 @@
         "success": 24
       },
       "completed": 24,
-      "completed_per_sec": 3.3903904257069573,
+      "completed_per_sec": 4.171450466507984,
       "failure": 0,
       "lane_dispatch_deltas": {
         "http": 0,
@@ -348,7 +388,11 @@
         "http_connection_reuse": 0,
         "wss_handshake_attempts": 1
       },
-      "wall_seconds": 7.07883075
+      "wall_seconds": 5.753394459,
+      "wss_prewarm": {
+        "attained": 4,
+        "target": 4
+      }
     },
     {
       "capacity_snapshot": {
@@ -370,7 +414,7 @@
         "success": 24
       },
       "completed": 24,
-      "completed_per_sec": 2.0661704133058203,
+      "completed_per_sec": 3.3461074279381213,
       "failure": 0,
       "lane_dispatch_deltas": {
         "http": 24,
@@ -386,9 +430,13 @@
         "http_connection_reuse": 24,
         "wss_handshake_attempts": 0
       },
-      "wall_seconds": 11.615692416
+      "wall_seconds": 7.172513291,
+      "wss_prewarm": {
+        "attained": 0,
+        "target": 0
+      }
     }
   ],
   "verdict": "pass",
-  "version": "0.1.14"
+  "version": "0.1.15"
 }

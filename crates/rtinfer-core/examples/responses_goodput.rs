@@ -51,6 +51,11 @@ const MAX_REQUESTS: usize = 128;
 const MAX_REPETITIONS: usize = 16;
 const MAX_WARMUPS: usize = 64;
 
+/// Before generic warmup asks, fill each enabled WSS pool to its configured
+/// initial concurrency window. This keeps WSS-only and dual measured runs from
+/// charging socket setup to the timed cohort.
+const WSS_PREWARM_POLICY: &str = "enabled_wss_lane_to_configured_initial_before_generic_warmups";
+
 #[derive(Clone, Copy)]
 struct Cli {
     requests: usize,
@@ -89,6 +94,20 @@ struct RunCounters {
     wss_limit: usize,
     http_max: usize,
     wss_max: usize,
+    wss_prewarm_target: usize,
+    wss_prewarm_attained: usize,
+}
+
+/// Mode → WSS prewarm target: `wss_initial` for Wss/Dual, 0 for Http.
+fn wss_prewarm_target_for_mode(mode: ResponsesTransportMode) -> usize {
+    if matches!(
+        mode,
+        ResponsesTransportMode::Wss | ResponsesTransportMode::Dual
+    ) {
+        ResponsesRuntimeConfig::defaults_for_mode(mode).wss_initial
+    } else {
+        0
+    }
 }
 
 fn print_help() {
@@ -318,6 +337,17 @@ async fn run_mode(
     warmups: usize,
 ) -> Result<RunCounters, String> {
     let client = build_client(mode, auth)?;
+    let wss_prewarm_target = wss_prewarm_target_for_mode(mode);
+    let wss_prewarm_attained = if wss_prewarm_target > 0 {
+        client.prewarm(wss_prewarm_target).await
+    } else {
+        0
+    };
+    if wss_prewarm_attained < wss_prewarm_target {
+        return Err(format!(
+            "wss prewarm attained {wss_prewarm_attained} idle sockets; need {wss_prewarm_target}"
+        ));
+    }
     if warmups > 0 {
         let _ = run_asks(&client, warmups).await;
     }
@@ -377,6 +407,8 @@ async fn run_mode(
         wss_limit: after.adaptive.websocket.limit,
         http_max: after.adaptive.http.max,
         wss_max: after.adaptive.websocket.max,
+        wss_prewarm_target,
+        wss_prewarm_attained,
     })
 }
 
@@ -410,6 +442,10 @@ fn run_to_json(rep: usize, mode: ResponsesTransportMode, c: &RunCounters) -> Val
         },
         "wall_seconds": c.wall_secs,
         "completed_per_sec": c.completed_per_sec,
+        "wss_prewarm": {
+            "target": c.wss_prewarm_target,
+            "attained": c.wss_prewarm_attained,
+        },
         "lane_dispatch_deltas": {
             "http": c.http_dispatches_delta,
             "wss": c.wss_dispatches_delta,
@@ -583,6 +619,11 @@ async fn main() {
             "requests": cli.requests,
             "repetitions": cli.repetitions,
             "warmups": cli.warmups,
+            "wss_prewarm": {
+                "policy": WSS_PREWARM_POLICY,
+                "count_per_enabled_mode": lane_defaults.wss_initial,
+                "enabled_modes": ["wss", "dual"],
+            },
             "runtime": {
                 "http_initial": lane_defaults.http_initial,
                 "http_max": lane_defaults.http_max,
@@ -677,6 +718,21 @@ mod tests {
         assert_eq!(dual.mode, ResponsesTransportMode::Dual);
         assert_eq!(wss.http_max, http.http_max);
         assert_eq!(wss.wss_max, dual.wss_max);
+    }
+
+    #[test]
+    fn wss_prewarm_target_is_wss_initial_for_enabled_modes_else_zero() {
+        let wss = ResponsesRuntimeConfig::defaults_for_mode(ResponsesTransportMode::Wss);
+        let dual = ResponsesRuntimeConfig::defaults_for_mode(ResponsesTransportMode::Dual);
+        assert_eq!(
+            wss_prewarm_target_for_mode(ResponsesTransportMode::Wss),
+            wss.wss_initial
+        );
+        assert_eq!(
+            wss_prewarm_target_for_mode(ResponsesTransportMode::Dual),
+            dual.wss_initial
+        );
+        assert_eq!(wss_prewarm_target_for_mode(ResponsesTransportMode::Http), 0);
     }
 
     #[test]

@@ -70,6 +70,10 @@ const WSS_HARD_MAX: usize = 64;
 const SSE_EVENT_BUFFER_MAX: usize = 1 << 20;
 const HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 const WSS_TERMINAL_DEADLINE: Duration = Duration::from_secs(120);
+/// Best-effort cleanup is deliberately bounded: a peer that keeps an ignored
+/// response body open must not retain an admitted request forever.
+const HTTP_BODY_DRAIN_LIMIT: usize = 64 * 1024;
+const HTTP_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 static RUSTLS_PROVIDER: Once = Once::new();
 
@@ -1343,6 +1347,7 @@ impl CodexResponsesHttpLane {
         let retry_after = parse_retry_after_header(response.get_header("retry-after"));
 
         if status == 401 || status == 403 {
+            drain_http_body(response.body_mut()).await;
             let refresh = self.auth.force_refresh_after(&auth.access_token).await;
             let mut outcome = AttemptOutcome::err(
                 ResponsesResultClass::Failure,
@@ -1399,6 +1404,7 @@ impl CodexResponsesHttpLane {
         }
 
         if !is_http2_version(&http_version) {
+            drain_http_body(response.body_mut()).await;
             let mut outcome = AttemptOutcome::err(
                 ResponsesResultClass::Failure,
                 RealtimeError::Protocol(format!(
@@ -1414,6 +1420,7 @@ impl CodexResponsesHttpLane {
 
         let content_type = response.content_type().map(str::to_owned);
         if !responses_content_type_allows_sse(content_type.as_deref()) {
+            drain_http_body(response.body_mut()).await;
             let mut outcome = AttemptOutcome::err(
                 ResponsesResultClass::Failure,
                 RealtimeError::Protocol(format!(
@@ -1501,13 +1508,27 @@ fn parse_retry_after_header(raw: Option<&str>) -> Option<u64> {
 }
 
 /// Continue draining only after a successful chunk; stop on EOF or transport error.
+#[cfg(test)]
 fn continue_http_body_drain<T, E>(chunk: &Option<Result<T, E>>) -> bool {
     matches!(chunk, Some(Ok(_)))
 }
 
-/// Drain remaining HTTP body chunks until EOF or the first transport error.
+/// Drain remaining HTTP chunks only within a small byte/time budget. Dropping
+/// this future (including caller cancellation) drops the body immediately, so
+/// cleanup cannot outlive the logical request.
 async fn drain_http_body(body: &mut warpsock::Body) {
-    while continue_http_body_drain(&body.chunk().await) {}
+    let deadline = tokio::time::Instant::now() + HTTP_BODY_DRAIN_TIMEOUT;
+    let mut drained = 0usize;
+    while drained < HTTP_BODY_DRAIN_LIMIT {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining, body.chunk()).await {
+            Ok(Some(Ok(chunk))) => drained = drained.saturating_add(chunk.len()),
+            Ok(None | Some(Err(_))) | Err(_) => break,
+        }
+    }
 }
 
 /// Map a forced-refresh result after HTTP 401/403 into the Failure error that
@@ -1545,15 +1566,20 @@ async fn classify_http_error_body(
     response: &mut warpsock::Response,
 ) -> Option<ResponsesResultClass> {
     let mut bytes = Vec::new();
+    let mut at_limit = false;
     while let Some(chunk) = response.body_mut().chunk().await {
         match chunk {
             Ok(c) => {
                 if append_bounded(&mut bytes, &c, HTTP_ERROR_BODY_LIMIT) {
+                    at_limit = true;
                     break;
                 }
             }
             Err(_) => break,
         }
+    }
+    if at_limit {
+        drain_http_body(response.body_mut()).await;
     }
     let v: Value = serde_json::from_slice(&bytes).ok()?;
     let code = v
@@ -1637,7 +1663,7 @@ impl CodexResponsesWssPool {
         }
     }
 
-    pub async fn prewarm(&self, count: usize) {
+    pub async fn prewarm(&self, count: usize) -> usize {
         let target = count.min(self.max_idle);
         for _ in 0..target {
             if self.idle_len().await >= target {
@@ -1647,7 +1673,7 @@ impl CodexResponsesWssPool {
                 Ok(a) => a,
                 Err(e) => {
                     debug!(error = %e, "codex/responses: prewarm auth unavailable; stopping");
-                    return;
+                    return self.idle_len().await;
                 }
             };
             match self.connect_socket(&auth).await {
@@ -1659,6 +1685,7 @@ impl CodexResponsesWssPool {
                 }
             }
         }
+        self.idle_len().await
     }
 
     async fn connect_socket(&self, auth: &CodexAuth) -> Result<ResponsesSocket, RealtimeError> {
@@ -1938,6 +1965,7 @@ impl CodexResponsesClientBuilder {
         // Mode-derived defaults only when no explicit runtime is supplied.
         // Explicit runtime is validated as-is (after optional mode override) —
         // never normalize aggregate or lane bounds.
+        let explicit_runtime = self.runtime.is_some();
         let mut runtime = match self.runtime {
             Some(mut runtime) => {
                 if let Some(mode) = self.mode {
@@ -1950,6 +1978,12 @@ impl CodexResponsesClientBuilder {
             ),
         };
         if let Some(cap) = self.legacy_capacity {
+            if explicit_runtime {
+                return Err(RealtimeError::Protocol(
+                    "responses config: legacy capacity cannot be combined with explicit runtime"
+                        .into(),
+                ));
+            }
             // Legacy wrapper knob only: capacity 0 maps to the WSS hard cap.
             // All other values must already be in 1..=WSS_HARD_MAX — never clamp.
             runtime.wss_max = if cap == 0 {
@@ -2086,13 +2120,17 @@ impl CodexResponsesClient {
         }
     }
 
-    pub async fn prewarm(&self, count: usize) {
+    /// Best-effort WSS idle prewarm. Returns the attained idle socket count.
+    /// HTTP mode is a no-op that returns 0.
+    pub async fn prewarm(&self, count: usize) -> usize {
         if self.mode == ResponsesTransportMode::Http {
             warn!("RTINFER_RESPONSES_PREWARM ignored in http transport mode");
-            return;
+            return 0;
         }
         if let Some(wss) = &self.wss {
-            wss.prewarm(count.min(self.runtime.wss_max)).await;
+            wss.prewarm(count.min(self.runtime.wss_max)).await
+        } else {
+            0
         }
     }
 
@@ -2909,6 +2947,33 @@ mod tests {
         expect_config_build_err(
             CodexResponsesClientBuilder {
                 legacy_capacity: Some(65),
+                ..Default::default()
+            }
+            .installation_id("11111111-1111-4111-8111-111111111111")
+            .auth_source(Arc::new(RecordingSource {
+                rejected: StdMutex::new(Vec::new()),
+            }))
+            .build(),
+        );
+    }
+
+    #[test]
+    fn legacy_capacity_does_not_normalize_an_explicit_runtime_aggregate() {
+        // A manually supplied runtime is a complete contract. The legacy
+        // wrapper must not make an otherwise-invalid aggregate valid by
+        // overwriting it to match its WSS capacity.
+        expect_config_build_err(
+            CodexResponsesClientBuilder {
+                runtime: Some(ResponsesRuntimeConfig {
+                    mode: ResponsesTransportMode::Wss,
+                    http_initial: 8,
+                    http_max: 256,
+                    wss_initial: 4,
+                    wss_max: 4,
+                    aggregate_max: 64,
+                    prewarm: 0,
+                }),
+                legacy_capacity: Some(4),
                 ..Default::default()
             }
             .installation_id("11111111-1111-4111-8111-111111111111")

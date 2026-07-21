@@ -955,7 +955,8 @@ async fn prewarm_does_not_consume_admission() {
     let (url, state, _stop) = spawn_wss_fixture().await;
     *state.handshake_hold.lock().await = Duration::ZERO;
     let client = client_for(ResponsesTransportMode::Wss, None, Some(url), 1, 4, 4).await;
-    client.prewarm(3).await;
+    let attained = client.prewarm(3).await;
+    assert_eq!(attained, 3);
     let snap = client.snapshot().await;
     assert_eq!(snap.adaptive.aggregate.in_flight, 0);
     assert_eq!(snap.adaptive.websocket.in_flight, 0);

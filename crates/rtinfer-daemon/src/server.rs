@@ -1487,10 +1487,24 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::to_bytes;
     use axum::http::StatusCode;
-    use rtinfer_core::{CodexAuth, CodexAuthSource, RealtimeError, ResponsesTransportMode};
+    use rtinfer_core::{
+        CodexAuth, CodexAuthSource, RealtimeError, ResponsesRuntimeConfig, ResponsesTransportMode,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::OnceLock;
     use tokio::sync::{Mutex, MutexGuard};
+
+    /// Far-future unsigned JWT so `initial_auth` stays a cache hit without
+    /// falling through to `~/.codex/auth.json` or the OAuth refresh path.
+    fn fixture_codex_auth() -> CodexAuth {
+        CodexAuth {
+            access_token: "fixture-access".into(),
+            account_id: "fixture-acct".into(),
+            id_token: ["eyJhbGciOiJub25lIn0", "eyJleHAiOjQxMDI0NDQ4MDB9", ""].join("."),
+            refresh_token: String::new(),
+            source_path: None,
+        }
+    }
 
     const RESPONSES_ENV_KEYS: &[&str] = &[
         "RTINFER_RESPONSES_TRANSPORT",
@@ -1822,6 +1836,107 @@ mod tests {
         assert!(text_start > structured_start);
     }
 
+    /// C5/Q2: both Responses tiers reach the coordinator and attempt a real
+    /// WSS handshake; observable handshake-attempt delta replaces source text
+    /// as proof of transport activity.
+    #[tokio::test]
+    async fn responses_tiers_execute_coordinator_handshake_side_effects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind drop listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                drop(sock);
+            }
+        });
+
+        let client = CodexResponsesClient::builder()
+            .mode(ResponsesTransportMode::Wss)
+            .runtime(ResponsesRuntimeConfig {
+                mode: ResponsesTransportMode::Wss,
+                http_initial: 1,
+                http_max: 1,
+                wss_initial: 1,
+                wss_max: 1,
+                aggregate_max: 1,
+                prewarm: 0,
+            })
+            .wss_endpoint(format!("ws://{addr}/"))
+            .installation_id("11111111-1111-4111-8111-111111111111")
+            .initial_auth(fixture_codex_auth())
+            .build()
+            .expect("wss fixture client");
+
+        let state = Arc::new(AppState {
+            warm_realtime: WarmSessionPool::new(WARM_SESSIONS_PER_MODEL, None),
+            codex_responses_client: client,
+            responses_prewarm: 0,
+            realtime_threads: ThreadRegistry::new(None),
+            auth_source: None,
+        });
+
+        let before = state.codex_responses_client.snapshot().await;
+        assert_eq!(before.wss_handshake_attempts, 0);
+        assert_eq!(before.http_dispatches, 0);
+
+        let text_req: RtInferRequest = serde_json::from_value(json!({
+            "contract": RTINFER_CONTRACT,
+            "tier": "responses_text",
+            "system": "sys",
+            "user": "ask",
+        }))
+        .unwrap();
+        let (text_status, text_body) =
+            response_json(rtinfer(State(state.clone()), Json(text_req)).await).await;
+        assert_eq!(text_status, StatusCode::BAD_GATEWAY);
+        assert_eq!(text_body["contract"], RTINFER_CONTRACT);
+        assert_eq!(text_body["ok"], false);
+        assert_eq!(text_body["error"]["code"], "provider_error");
+        assert_eq!(text_body["error"]["retryable"], true);
+        assert!(text_body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("responses_text upstream error: handshake"));
+
+        let structured_req: RtInferRequest = serde_json::from_value(json!({
+            "contract": RTINFER_CONTRACT,
+            "tier": "responses_structured",
+            "system": "sys",
+            "user": "ask",
+            "schema_name": "Answer",
+            "schema": {
+                "type": "object",
+                "properties": { "ok": { "type": "boolean" } },
+                "required": ["ok"],
+                "additionalProperties": false
+            },
+        }))
+        .unwrap();
+        let (structured_status, structured_body) =
+            response_json(rtinfer(State(state.clone()), Json(structured_req)).await).await;
+        assert_eq!(structured_status, StatusCode::BAD_GATEWAY);
+        assert_eq!(structured_body["contract"], RTINFER_CONTRACT);
+        assert_eq!(structured_body["ok"], false);
+        assert_eq!(structured_body["error"]["code"], "provider_error");
+        assert_eq!(structured_body["error"]["retryable"], true);
+        assert!(structured_body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("responses_structured upstream error: handshake"));
+
+        let after = state.codex_responses_client.snapshot().await;
+        assert_eq!(
+            after.wss_handshake_attempts - before.wss_handshake_attempts,
+            2,
+            "both Responses tiers must each attempt one WSS handshake"
+        );
+        assert_eq!(after.http_dispatches, 0);
+    }
+
     /// Executable proof that the rtinfer handler selects the Responses tier
     /// arm and returns its stable validation envelope without contacting upstream.
     #[tokio::test]
@@ -2017,6 +2132,180 @@ mod tests {
             message.contains("responses_structured upstream error: provider:rate_limit_exceeded")
         );
         assert!(!message.contains(SENTINEL));
+    }
+
+    /// C7/Q3: every named auth / handshake / provider taxonomy branch maps to
+    /// the stable rtinfer/1 envelope with code_or_label-only messages.
+    #[tokio::test]
+    async fn rtinfer_map_realtime_err_taxonomy_branches() {
+        const TIER: &str = "responses_text";
+
+        struct MapCase {
+            name: &'static str,
+            err: RealtimeError,
+            status: StatusCode,
+            code: &'static str,
+            retryable: bool,
+            label: &'static str,
+            forbidden: &'static [&'static str],
+        }
+
+        let json_err: RealtimeError = serde_json::from_str::<Value>("not-json-fixture")
+            .unwrap_err()
+            .into();
+
+        let cases = vec![
+            MapCase {
+                name: "auth_file",
+                err: RealtimeError::AuthFile {
+                    path: PathBuf::from("/tmp/rtinfer-fixture-auth.json"),
+                    source: std::io::Error::new(std::io::ErrorKind::NotFound, "fixture-not-found"),
+                },
+                status: StatusCode::UNAUTHORIZED,
+                code: "auth_unavailable",
+                retryable: false,
+                label: "auth_file",
+                forbidden: &["fixture-not-found", "/tmp/rtinfer-fixture-auth.json"],
+            },
+            MapCase {
+                name: "auth_missing",
+                err: RealtimeError::AuthMissing("tokens"),
+                status: StatusCode::UNAUTHORIZED,
+                code: "auth_unavailable",
+                retryable: false,
+                label: "auth_missing",
+                forbidden: &["tokens"],
+            },
+            MapCase {
+                name: "auth_malformed",
+                err: RealtimeError::AuthMalformed("fixture-malformed-auth".into()),
+                status: StatusCode::UNAUTHORIZED,
+                code: "auth_unavailable",
+                retryable: false,
+                label: "auth_malformed",
+                forbidden: &["fixture-malformed-auth"],
+            },
+            MapCase {
+                name: "refresh",
+                err: RealtimeError::Refresh("token endpoint returned HTTP 500".into()),
+                status: StatusCode::UNAUTHORIZED,
+                code: "auth_unavailable",
+                retryable: false,
+                label: "refresh",
+                forbidden: &["token endpoint returned HTTP 500"],
+            },
+            MapCase {
+                name: "handshake_401",
+                err: RealtimeError::Handshake("HTTP 401 Unauthorized".into()),
+                status: StatusCode::BAD_GATEWAY,
+                code: "provider_error",
+                retryable: true,
+                label: "handshake",
+                forbidden: &["HTTP 401 Unauthorized", "Unauthorized"],
+            },
+            MapCase {
+                name: "handshake_403",
+                err: RealtimeError::Handshake("HTTP 403 Forbidden".into()),
+                status: StatusCode::BAD_GATEWAY,
+                code: "provider_error",
+                retryable: true,
+                label: "handshake",
+                forbidden: &["HTTP 403 Forbidden", "Forbidden"],
+            },
+            MapCase {
+                name: "handshake_ordinary",
+                err: RealtimeError::Handshake("connection reset by peer".into()),
+                status: StatusCode::BAD_GATEWAY,
+                code: "provider_error",
+                retryable: true,
+                label: "handshake",
+                forbidden: &["connection reset by peer"],
+            },
+            MapCase {
+                name: "protocol",
+                err: RealtimeError::Protocol("fixture protocol detail".into()),
+                status: StatusCode::BAD_GATEWAY,
+                code: "provider_error",
+                retryable: true,
+                label: "protocol",
+                forbidden: &["fixture protocol detail"],
+            },
+            MapCase {
+                name: "provider",
+                err: RealtimeError::Provider {
+                    code: "rate_limit_exceeded".into(),
+                    message: "PROVIDER_BODY_fixture".into(),
+                },
+                status: StatusCode::BAD_GATEWAY,
+                code: "provider_error",
+                retryable: true,
+                label: "provider:rate_limit_exceeded",
+                forbidden: &["PROVIDER_BODY_fixture"],
+            },
+            MapCase {
+                name: "tool_limit",
+                err: RealtimeError::ToolLimit("wall clock timeout fixture".into()),
+                status: StatusCode::BAD_GATEWAY,
+                code: "provider_error",
+                retryable: true,
+                label: "tool_limit",
+                forbidden: &["wall clock timeout fixture"],
+            },
+            MapCase {
+                name: "io",
+                err: RealtimeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "io-fixture-body",
+                )),
+                status: StatusCode::BAD_GATEWAY,
+                code: "provider_error",
+                retryable: true,
+                label: "io",
+                forbidden: &["io-fixture-body"],
+            },
+            MapCase {
+                name: "json",
+                err: json_err,
+                status: StatusCode::BAD_GATEWAY,
+                code: "provider_error",
+                retryable: true,
+                label: "json",
+                forbidden: &["not-json-fixture"],
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                case.err.code_or_label(),
+                case.label,
+                "case {}: unexpected code_or_label",
+                case.name
+            );
+            let expected_message = format!("{TIER} upstream error: {}", case.label);
+            let (got_status, body) = response_json(rtinfer_map_realtime_err(TIER, case.err)).await;
+            assert_eq!(got_status, case.status, "case {}: status", case.name);
+            assert_eq!(
+                body["contract"], RTINFER_CONTRACT,
+                "case {}: contract",
+                case.name
+            );
+            assert_eq!(body["ok"], false, "case {}: ok", case.name);
+            assert_eq!(body["error"]["code"], case.code, "case {}: code", case.name);
+            assert_eq!(
+                body["error"]["retryable"], case.retryable,
+                "case {}: retryable",
+                case.name
+            );
+            let message = body["error"]["message"].as_str().unwrap();
+            assert_eq!(message, expected_message, "case {}: message", case.name);
+            for needle in case.forbidden {
+                assert!(
+                    !message.contains(needle),
+                    "case {}: message leaked body fragment {needle:?}: {message}",
+                    case.name
+                );
+            }
+        }
     }
 
     #[tokio::test]

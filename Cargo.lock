@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "rtinfer-core"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "async-trait",
  "base64",
@@ -1256,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "rtinfer-daemon"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "async-trait",
