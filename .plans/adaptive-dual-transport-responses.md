@@ -71,11 +71,11 @@
 | Variable | Default | Valid values / hard bound | Behavior |
 |---|---:|---|---|
 | `RTINFER_RESPONSES_TRANSPORT` | `wss` | `wss`, `dual`, `http` only | Unset or blank means `wss`; any other value fails daemon construction. |
-| `RTINFER_RESPONSES_HTTP_INITIAL` | `8` | integer `1..=HTTP_MAX` | Initial HTTP window. |
-| `RTINFER_RESPONSES_HTTP_MAX` | `256` | integer `1..=256` | HTTP window hard maximum. |
-| `RTINFER_RESPONSES_WSS_INITIAL` | `4` | integer `1..=WSS_MAX` | Initial WSS window. |
-| `RTINFER_RESPONSES_WSS_MAX` | `64` | integer `1..=64` | WSS window and idle-pool hard maximum. |
-| `RTINFER_RESPONSES_AGGREGATE_MAX` | enabled-lane maxima sum | `1..=256` in `http`, `1..=64` in `wss`, `2..=320` in `dual`; MUST NOT exceed the enabled-lane maxima sum | Fixed process ceiling; it does not grow adaptively. |
+| `RTINFER_RESPONSES_HTTP_INITIAL` | `32` | integer `1..=HTTP_MAX` | Initial HTTP window. |
+| `RTINFER_RESPONSES_HTTP_MAX` | `48` | integer `1..=256` | HTTP window maximum; `256` remains the explicit hard bound. |
+| `RTINFER_RESPONSES_WSS_INITIAL` | `32` | integer `1..=WSS_MAX` | Initial WSS window. |
+| `RTINFER_RESPONSES_WSS_MAX` | `48` | integer `1..=64` | WSS window and idle-pool maximum; `64` remains the explicit hard bound. |
+| `RTINFER_RESPONSES_AGGREGATE_MAX` | `48` | `1..=256` in `http`, `1..=64` in `wss`, `2..=320` in `dual`; MUST NOT exceed the enabled-lane maxima sum | Fixed process ceiling; it does not grow adaptively. |
 | `RTINFER_RESPONSES_PREWARM` | `0` | integer `0..=WSS_MAX` | Existing name retained; ignored with one warning in `http`, opens that many idle WSS sockets otherwise. |
 
 - Lane minimum is fixed at `1`; zero-start and total lane collapse are not v1 behaviors.

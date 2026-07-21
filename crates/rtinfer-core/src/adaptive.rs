@@ -1,6 +1,6 @@
 //! Adaptive concurrency control shared by the HTTP and WebSocket Responses lanes.
 //!
-//! Both transports start with a small independent window. A saturated lane grows
+//! Both transports start with an independent window. A saturated lane grows
 //! immediately until it observes upstream overload, then switches to additive
 //! increase and multiplicative decrease. Keeping separate windows lets HTTP/2
 //! discover its multiplexing ceiling without letting a WebSocket handshake or
@@ -54,16 +54,16 @@ impl Default for AdaptiveConcurrencyConfig {
     fn default() -> Self {
         Self {
             http: ConcurrencyLimits {
-                initial: 8,
+                initial: 32,
                 min: 1,
-                max: 256,
+                max: 48,
             },
             websocket: ConcurrencyLimits {
-                initial: 4,
+                initial: 32,
                 min: 1,
-                max: 64,
+                max: 48,
             },
-            aggregate_max: 320,
+            aggregate_max: 48,
         }
     }
 }
@@ -627,6 +627,16 @@ mod tests {
             },
             aggregate_max: 12,
         }
+    }
+
+    #[test]
+    fn defaults_start_at_32_with_a_48_ceiling() {
+        let config = AdaptiveConcurrencyConfig::default();
+        assert_eq!(config.http.initial, 32);
+        assert_eq!(config.http.max, 48);
+        assert_eq!(config.websocket.initial, 32);
+        assert_eq!(config.websocket.max, 48);
+        assert_eq!(config.aggregate_max, 48);
     }
 
     #[test]

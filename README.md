@@ -54,9 +54,9 @@ other lane.
 | Setting | Default / accepted values |
 | --- | --- |
 | `RTINFER_RESPONSES_TRANSPORT` | `wss`; `wss`, `http`, or `dual` |
-| `RTINFER_RESPONSES_HTTP_INITIAL`, `RTINFER_RESPONSES_HTTP_MAX` | `8`, `256` (each bounded; initial cannot exceed max) |
-| `RTINFER_RESPONSES_WSS_INITIAL`, `RTINFER_RESPONSES_WSS_MAX` | `4`, `64` (each bounded; initial cannot exceed max) |
-| `RTINFER_RESPONSES_AGGREGATE_MAX` | Enabled-lane maximum sum by default: 64 WSS, 256 HTTP, or 320 dual |
+| `RTINFER_RESPONSES_HTTP_INITIAL`, `RTINFER_RESPONSES_HTTP_MAX` | `32`, `48` (initial cannot exceed max; explicit max hard bound `256`) |
+| `RTINFER_RESPONSES_WSS_INITIAL`, `RTINFER_RESPONSES_WSS_MAX` | `32`, `48` (initial cannot exceed max; explicit max hard bound `64`) |
+| `RTINFER_RESPONSES_AGGREGATE_MAX` | `48` in every mode; cannot exceed the enabled-lane maxima sum |
 | `RTINFER_RESPONSES_PREWARM` | `0`; opens WSS sockets only, so it is ignored in HTTP-only mode |
 | `RTINFER_RESPONSES_CAPACITY` | Deprecated WSS-max alias. `0` maps to the bounded hard maximum, `64`; use `RTINFER_RESPONSES_WSS_MAX` instead. |
 

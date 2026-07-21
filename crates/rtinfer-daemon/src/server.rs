@@ -1681,6 +1681,9 @@ mod tests {
         );
         let snap = state.codex_responses_client.snapshot().await;
         assert_eq!(snap.mode, ResponsesTransportMode::Wss);
+        assert_eq!(snap.adaptive.websocket.limit, 32);
+        assert_eq!(snap.adaptive.websocket.max, 48);
+        assert_eq!(snap.adaptive.aggregate.limit, 48);
         assert_eq!(snap.http_dispatches, 0);
         assert_eq!(snap.wss_handshake_attempts, 0);
 
@@ -1811,8 +1814,8 @@ mod tests {
         let state = AppState::new_file_auth().unwrap();
         let snap = state.codex_responses_client.snapshot().await;
         assert_eq!(snap.adaptive.websocket.max, 64);
-        assert_eq!(snap.adaptive.websocket.limit, 4);
-        assert_eq!(snap.adaptive.aggregate.limit, 64);
+        assert_eq!(snap.adaptive.websocket.limit, 32);
+        assert_eq!(snap.adaptive.aggregate.limit, 48);
         let health = health_json(state).await;
         assert_eq!(health["responses"]["websocket"]["max"], 64);
     }

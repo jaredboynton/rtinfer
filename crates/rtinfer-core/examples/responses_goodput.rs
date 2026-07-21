@@ -706,13 +706,19 @@ mod tests {
     }
 
     #[test]
-    fn mode_defaults_are_enabled_lane_aggregate_ceilings() {
+    fn mode_defaults_start_at_32_with_a_48_ceiling() {
         let wss = ResponsesRuntimeConfig::defaults_for_mode(ResponsesTransportMode::Wss);
         let http = ResponsesRuntimeConfig::defaults_for_mode(ResponsesTransportMode::Http);
         let dual = ResponsesRuntimeConfig::defaults_for_mode(ResponsesTransportMode::Dual);
-        assert_eq!(wss.aggregate_max, 64);
-        assert_eq!(http.aggregate_max, 256);
-        assert_eq!(dual.aggregate_max, 320);
+        assert_eq!(wss.aggregate_max, 48);
+        assert_eq!(http.aggregate_max, 48);
+        assert_eq!(dual.aggregate_max, 48);
+        assert_eq!(wss.wss_initial, 32);
+        assert_eq!(http.http_initial, 32);
+        assert_eq!(dual.http_initial, 32);
+        assert_eq!(dual.wss_initial, 32);
+        assert_eq!(wss.wss_max, 48);
+        assert_eq!(http.http_max, 48);
         assert_eq!(wss.mode, ResponsesTransportMode::Wss);
         assert_eq!(http.mode, ResponsesTransportMode::Http);
         assert_eq!(dual.mode, ResponsesTransportMode::Dual);

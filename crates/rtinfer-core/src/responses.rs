@@ -67,6 +67,9 @@ static HANDSHAKE_GATE: Semaphore = Semaphore::const_new(HANDSHAKE_GATE_PERMITS);
 
 const HTTP_HARD_MAX: usize = 256;
 const WSS_HARD_MAX: usize = 64;
+const DEFAULT_INITIAL: usize = 32;
+const DEFAULT_LANE_MAX: usize = 48;
+const DEFAULT_AGGREGATE_MAX: usize = 48;
 const SSE_EVENT_BUFFER_MAX: usize = 1 << 20;
 const HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 const WSS_TERMINAL_DEADLINE: Duration = Duration::from_secs(120);
@@ -1024,21 +1027,16 @@ impl Default for ResponsesRuntimeConfig {
 }
 
 impl ResponsesRuntimeConfig {
-    /// Mode-appropriate defaults: aggregate equals the enabled-lane maxima sum
-    /// (`64` WSS, `256` HTTP, `320` Dual).
+    /// Defaults each lane to a 32-request starting window with a fixed
+    /// 48-request lane and aggregate ceiling.
     pub fn defaults_for_mode(mode: ResponsesTransportMode) -> Self {
-        let aggregate_max = match mode {
-            ResponsesTransportMode::Wss => WSS_HARD_MAX,
-            ResponsesTransportMode::Http => HTTP_HARD_MAX,
-            ResponsesTransportMode::Dual => HTTP_HARD_MAX + WSS_HARD_MAX,
-        };
         Self {
             mode,
-            http_initial: 8.min(HTTP_HARD_MAX),
-            http_max: HTTP_HARD_MAX,
-            wss_initial: 4.min(WSS_HARD_MAX),
-            wss_max: WSS_HARD_MAX,
-            aggregate_max,
+            http_initial: DEFAULT_INITIAL,
+            http_max: DEFAULT_LANE_MAX,
+            wss_initial: DEFAULT_INITIAL,
+            wss_max: DEFAULT_LANE_MAX,
+            aggregate_max: DEFAULT_AGGREGATE_MAX,
             prewarm: 0,
         }
     }
@@ -1105,19 +1103,23 @@ impl ResponsesRuntimeConfig {
         };
         let http_max = parse_bound_env(
             "RTINFER_RESPONSES_HTTP_MAX",
-            HTTP_HARD_MAX,
+            DEFAULT_LANE_MAX,
             1,
             HTTP_HARD_MAX,
         )?;
         let http_initial = parse_bound_env(
             "RTINFER_RESPONSES_HTTP_INITIAL",
-            8.min(http_max),
+            DEFAULT_INITIAL.min(http_max),
             1,
             http_max,
         )?;
         let (wss_max, legacy_zero_warned) = parse_wss_max_from_env()?;
-        let wss_initial =
-            parse_bound_env("RTINFER_RESPONSES_WSS_INITIAL", 4.min(wss_max), 1, wss_max)?;
+        let wss_initial = parse_bound_env(
+            "RTINFER_RESPONSES_WSS_INITIAL",
+            DEFAULT_INITIAL.min(wss_max),
+            1,
+            wss_max,
+        )?;
         let enabled_sum = match mode {
             ResponsesTransportMode::Http => http_max,
             ResponsesTransportMode::Wss => wss_max,
@@ -1130,7 +1132,7 @@ impl ResponsesRuntimeConfig {
         };
         let aggregate_max = parse_bound_env(
             "RTINFER_RESPONSES_AGGREGATE_MAX",
-            enabled_sum.min(agg_hi).max(agg_lo),
+            DEFAULT_AGGREGATE_MAX.min(agg_hi).max(agg_lo),
             agg_lo,
             agg_hi,
         )?;
@@ -1245,7 +1247,7 @@ fn parse_wss_max_from_env() -> Result<(usize, bool), RealtimeError> {
                 Ok((v, false))
             }
         }
-        (None, None) => Ok((WSS_HARD_MAX, false)),
+        (None, None) => Ok((DEFAULT_LANE_MAX, false)),
     }
 }
 
@@ -2985,7 +2987,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_mode_defaults_aggregate_enabled_sum() {
+    async fn builder_mode_defaults_start_at_32_with_a_48_ceiling() {
         let auth = Arc::new(RecordingSource {
             rejected: StdMutex::new(Vec::new()),
         });
@@ -2997,7 +2999,10 @@ mod tests {
             .auth_source(auth.clone())
             .build()
             .expect("wss defaults");
-        assert_eq!(wss.snapshot().await.adaptive.aggregate.limit, 64);
+        let wss_snapshot = wss.snapshot().await;
+        assert_eq!(wss_snapshot.adaptive.websocket.limit, 32);
+        assert_eq!(wss_snapshot.adaptive.websocket.max, 48);
+        assert_eq!(wss_snapshot.adaptive.aggregate.limit, 48);
 
         let http = CodexResponsesClient::builder()
             .mode(ResponsesTransportMode::Http)
@@ -3005,7 +3010,10 @@ mod tests {
             .auth_source(auth.clone())
             .build()
             .expect("http defaults");
-        assert_eq!(http.snapshot().await.adaptive.aggregate.limit, 256);
+        let http_snapshot = http.snapshot().await;
+        assert_eq!(http_snapshot.adaptive.http.limit, 32);
+        assert_eq!(http_snapshot.adaptive.http.max, 48);
+        assert_eq!(http_snapshot.adaptive.aggregate.limit, 48);
 
         let dual = CodexResponsesClient::builder()
             .mode(ResponsesTransportMode::Dual)
@@ -3013,7 +3021,10 @@ mod tests {
             .auth_source(auth.clone())
             .build()
             .expect("dual defaults");
-        assert_eq!(dual.snapshot().await.adaptive.aggregate.limit, 320);
+        let dual_snapshot = dual.snapshot().await;
+        assert_eq!(dual_snapshot.adaptive.http.limit, 32);
+        assert_eq!(dual_snapshot.adaptive.websocket.limit, 32);
+        assert_eq!(dual_snapshot.adaptive.aggregate.limit, 48);
 
         // Explicit runtime above HTTP enabled sum must reject — never normalize.
         expect_config_build_err(
